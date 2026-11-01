@@ -363,7 +363,7 @@ async def main_loop():
     state = load_state()
 
     if not state.get("started_message_sent"):
-        await tg.send("اللهم صلِّ وسلّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️)
+        await tg.send("اللهم صلِّ وسلّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
         state["started_message_sent"] = True
         save_state(state)
 
