@@ -46,9 +46,9 @@ FVG_STOP_DISTANCE = 1.00
 NO_NEW_FIRST_HOUR = True
 NO_NEW_LAST_HOUR = True
 
-TP_OFFSETS = [0.70, 1.00, 1.70, 2.00, 3.50]
-PROGRESS_START = 0.30
-PROGRESS_STEP = 0.20
+TP_OFFSETS = [7.0, 10.0, 17.0, 20.0, 35.0]
+PROGRESS_START = 3.0
+PROGRESS_STEP = 2.0
 
 # ========================= LOGGING =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -208,7 +208,7 @@ def fmt_price(x: float) -> str:
 
 def signed_points(delta: float, side: str) -> int:
     favorable = delta if side == "buy" else -delta
-    return max(0, int(round(favorable * 100)))
+    return max(0, int(round(favorable * 10)))
 
 
 def side_word(side: str) -> str:
@@ -238,7 +238,7 @@ def activated_text(tr: dict[str, Any]) -> str:
 
 
 def progress_text(tr: dict[str, Any], points: int) -> str:
-    phrases = {30: "🔥 الصفقة تمشي صح ✅", 90: "💪🔥 يا وحش 🔥💪", 120: "👑 يا معلم 👑"}
+    phrases = {30: "🔥 الصفقة تمشي صح ✅", 90: "💪🔥 يا وحش 🔥💪", 110: "👑 يا معلم 👑"}
     phrase = phrases.get(points, "🔥 الصفقة مستمرة ✅")
     return f"{phrase}\n💰 **+{points} نقطة** 📈✅"
 
@@ -453,7 +453,7 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
             else:
                 favorable = float(q.high.max())
                 move = favorable - tr["entry"]
-            points = max(0, int(round(move * 100)))
+            points = max(0, int(round(move * 10)))
             stopped = False
             for ts, bar in q.iterrows():
                 if (side == "sell" and float(bar.high) >= tr["stop"]) or (side == "buy" and float(bar.low) <= tr["stop"]):
@@ -472,9 +472,11 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
                     tr["hit_tps"].append(n)
                     await tg.send(tp_text(tr, n, signed_points(abs(target - tr["entry"]), "buy")))
                     save_state(state)
-            if points >= PROGRESS_START * 100:
-                step = int(PROGRESS_STEP * 100)
-                milestone = int(math.floor(points / step) * step)
+            start_pts = int(round(PROGRESS_START * 10))
+            step_pts = int(round(PROGRESS_STEP * 10))
+            if points >= start_pts:
+                # المراحل: 30 ثم 50 ثم 70 ثم 90 ثم 110 ...
+                milestone = start_pts + ((points - start_pts) // step_pts) * step_pts
                 if milestone > tr.get("last_progress", 0):
                     tr["last_progress"] = milestone
                     await tg.send(progress_text(tr, milestone))
