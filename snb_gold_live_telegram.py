@@ -363,7 +363,7 @@ async def main_loop():
     state = load_state()
 
     if not state.get("started_message_sent"):
-        await tg.send("✅ **SNB GOLD LIVE اشتغل**\n\n📡 بدأ جلب بيانات XAUUSD والمتابعة اللحظية.\n⏱️ لا توجد إشارات جديدة في أول وآخر ساعة من يوم الرياض.")
+        await tg.send("اللهم صلِّ وسلّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️)
         state["started_message_sent"] = True
         save_state(state)
 
