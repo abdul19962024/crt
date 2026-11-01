@@ -1,0 +1,5 @@
+telethon
+aiohttp
+pandas
+requests
+dukascopy-python<5

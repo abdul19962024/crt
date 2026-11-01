@@ -1,0 +1,4 @@
+__pycache__/
+snb_live_data/
+*.session
+.env
