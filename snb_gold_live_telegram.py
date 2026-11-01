@@ -40,6 +40,7 @@ PENDING_OFFSET = 1.00
 MIN_STOP = 3.00
 RAW_STOP_BUFFER = 0.10
 PENDING_EXPIRY_HOURS = 2
+SIGNAL_MAX_AGE_MINUTES = 10   # تجاهل الإشارات الأقدم من هذا (يمنع إشارات قديمة بعد إعادة التشغيل)
 FVG_DELAY_MINUTES = 10
 FVG_STOP_DISTANCE = 1.00
 
@@ -278,13 +279,14 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
     h2 = resample(bid, 120)
     m5 = resample(bid, 5)
     setups: list[dict[str, Any]] = []
+    now_utc = pd.Timestamp.now(tz="UTC")
     if len(h2) < 3 or len(m5) < 5:
         return setups
 
-    for i in range(2, len(h2) - 1):
+    # كل شمعة H2 مغلقة (بما فيها الأخيرة): نافذة التأكيد تبدأ بعد إغلاقها مباشرة.
+    # نفحص الشموع المتاحة فقط (M5 المغلقة)، فتُكتشف الإشارة لحظة تأكدها دون انتظار نهاية النافذة.
+    for i in range(2, len(h2)):
         hs = h2.index[i]
-        if hs + pd.Timedelta(hours=4) > m5.index[-1] + pd.Timedelta(minutes=5):
-            continue
         hb = h2.iloc[i]
         if not allow_new_signal(hs):
             continue
@@ -305,6 +307,9 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
             key = signal_key(hs, side)
             if key in state["signals"]:
                 break
+            # إشارة قديمة (مثلاً بعد إعادة تشغيل ضاعت فيها الحالة): لا ترسلها
+            if now_utc - (confirm_time + pd.Timedelta(minutes=5)) > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
+                continue
             raw_stop = max(float(first.high), float(second.high)) + RAW_STOP_BUFFER if sell else min(float(first.low), float(second.low)) - RAW_STOP_BUFFER
             raw_risk = abs(equal - raw_stop)
             if raw_risk < MIN_STOP:
