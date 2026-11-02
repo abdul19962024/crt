@@ -300,9 +300,10 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
             lower = min(float(first.low), float(second.low)) <= float(hb.low)
             equal = (float(first.close) + float(second.open)) / 2
             near = abs(float(first.close) - float(second.open)) <= MAX_EQUAL_GAP
-            inside = float(hb.low) < float(second.close) < float(hb.high)
-            sell = upper and near and inside and first.close > first.open and second.close < second.open
-            buy = lower and near and inside and first.close < first.open and second.close > second.open
+            # القاعدة الموسّعة: يكفي أن تلمس إحدى الشمعتين حافة H2؛
+            # لا يُشترط أن يغلق إغلاق الشمعة الثانية داخل نطاق H2.
+            sell = upper and near and first.close > first.open and second.close < second.open
+            buy = lower and near and first.close < first.open and second.close > second.open
             if not (sell or buy):
                 continue
             side = "sell" if sell else "buy"
