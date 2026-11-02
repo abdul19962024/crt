@@ -29,7 +29,9 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 
 DATA_DIR = Path(os.getenv("SNB_DATA_DIR", str(Path.home() / "snb_live_data")))
 STATE_FILE = DATA_DIR / "snb_gold_live_state.json"
-POLL_SECONDS = 5
+LIVE_POLL_SECONDS = 3        # فحص السعر اللحظي للصفقات (كل 3 ثوانٍ)
+DETECT_POLL_SECONDS = 5      # البحث عن إشارات جديدة (جلب 18 ساعة كما كان)
+LIVE_WINDOW_MINUTES = 15     # نافذة الجلب الخفيف للمتابعة اللحظية
 LOOKBACK_HOURS = 18
 TIMEZONE = "Asia/Riyadh"
 INSTRUMENT = "XAU/USD"
@@ -111,9 +113,9 @@ def get_duka():
         raise SystemExit(f"فشل استيراد dukascopy: {exc!r}") from exc
 
 
-def fetch_1m(duka, instrument, side: str) -> pd.DataFrame:
+def fetch_1m(duka, instrument, side: str, hours: float = LOOKBACK_HOURS) -> pd.DataFrame:
     now = pd.Timestamp.now(tz="UTC")
-    start = now - pd.Timedelta(hours=LOOKBACK_HOURS)
+    start = now - pd.Timedelta(hours=hours)
     interval = getattr(duka, "INTERVAL_MIN_1")
     offer_side = getattr(duka, f"OFFER_SIDE_{side}")
     got = duka.fetch(
@@ -360,6 +362,120 @@ def make_fvg_order(tr: dict[str, Any], bid: pd.DataFrame, m5: pd.DataFrame) -> O
 
 
 # ========================= LIVE ENGINE =========================
+def opposite(side: str) -> str:
+    return "buy" if side == "sell" else "sell"
+
+
+def has_active(state: dict[str, Any], side: str) -> bool:
+    return any(t.get("status") == "active" and t["side"] == side for t in state["active"].values())
+
+
+def merge_tail(old: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
+    """يدمج شموع جديدة فوق القديمة (الجديدة تتغلب عند التداخل) ويقص الأقدم من نافذة الجلب."""
+    if old is None or old.empty:
+        out = new
+    else:
+        out = pd.concat([old[~old.index.isin(new.index)], new]).sort_index()
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=LOOKBACK_HOURS + 1)
+    return out[out.index >= cutoff]
+
+
+def touch_time(side: str, level: float, trigger: pd.DataFrame, price: Optional[float],
+               start: pd.Timestamp, end: pd.Timestamp, now: pd.Timestamp) -> Optional[pd.Timestamp]:
+    """متى لمس السعر المستوى: من شموع دقيقة مغلقة، أو من السعر اللحظي الحالي."""
+    fl = now.floor("1min")
+    q = trigger[(trigger.index >= start) & (trigger.index < end) & (trigger.index + pd.Timedelta(minutes=1) <= fl)]
+    hit = q[q.high >= level] if side == "sell" else q[q.low <= level]
+    if len(hit):
+        return hit.index[0] + pd.Timedelta(minutes=1)
+    if price is not None and start <= now < end:
+        if (side == "sell" and price >= level) or (side == "buy" and price <= level):
+            return now
+    return None
+
+
+async def cancel_opposites(state: dict[str, Any], side: str, tg: "TelegramSender") -> None:
+    """بعد تفعيل صفقة: الأوامر المعلقة المعاكسة تُلغى ولا تُتابع."""
+    for k, t in state["active"].items():
+        if t.get("status") == "pending" and t["side"] == opposite(side):
+            t["status"] = "cancelled"
+            await tg.edit_cancelled(t.get("message_id"), cancelled_text(t))
+            if k in state["signals"]:
+                state["signals"][k]["status"] = "cancelled_opposite"
+
+
+async def activate(state: dict[str, Any], tr: dict[str, Any], source: str, when: pd.Timestamp, tg: "TelegramSender") -> None:
+    tr["status"] = "active"
+    tr["entry_time"] = when.isoformat()
+    tr["entry_source"] = source
+    tr["best"] = tr["entry"]
+    await tg.send(activated_text(tr), reply_to=tr.get("message_id"))
+    await cancel_opposites(state, tr["side"], tg)
+    save_state(state)
+
+
+async def nap(seconds: int) -> None:
+    for _ in range(seconds):
+        if STOP_REQUESTED:
+            return
+        await asyncio.sleep(1)
+
+
+async def register_signal(state: dict[str, Any], tr: dict[str, Any], tg: "TelegramSender") -> None:
+    """إشارة جديدة: تُغلق بصمت أي صفقة نشطة معاكسة لها، ثم تُرسل وتُتابع. نفس الاتجاه: الاثنتان تُتابعان."""
+    for k, t in state["active"].items():
+        if t.get("status") == "active" and t["side"] == opposite(tr["side"]):
+            t["status"] = "closed"
+            t["close_reason"] = "REVERSED"
+            if k in state["signals"]:
+                state["signals"][k]["status"] = "closed_reversed"
+            log.info("Stopped following %s (opposite signal %s)", k, tr["key"])
+    msg_id = await tg.send(pending_text(tr))
+    tr["message_id"] = msg_id
+    state["signals"][tr["key"]] = {"created": tr["created_at"], "status": "pending"}
+    state["active"][tr["key"]] = tr
+    save_state(state)
+    log.info("New pending %s %s", tr["key"], tr["entry"])
+
+
+async def live_loop(duka, instrument, state, tg, cache, lock):
+    """كل LIVE_POLL_SECONDS: سعر لحظي للصفقات المعلقة والنشطة (نفس مكتبة Dukascopy)."""
+    while not STOP_REQUESTED:
+        try:
+            if any(t.get("status") in ("pending", "active") for t in state["active"].values()):
+                sb, sa = await asyncio.gather(
+                    asyncio.to_thread(fetch_1m, duka, instrument, "BID", LIVE_WINDOW_MINUTES / 60),
+                    asyncio.to_thread(fetch_1m, duka, instrument, "ASK", LIVE_WINDOW_MINUTES / 60),
+                )
+                async with lock:
+                    cache["bid"] = merge_tail(cache.get("bid"), sb)
+                    cache["ask"] = merge_tail(cache.get("ask"), sa)
+                    prices = {"bid": float(sb.close.iloc[-1]), "ask": float(sa.close.iloc[-1])}
+                    m5 = resample(cache["bid"], 5)
+                    await manage_trades(state, cache["bid"], cache["ask"], m5, tg, prices)
+        except Exception as exc:
+            log.warning("Live tick failed (will retry): %r", exc)
+        await asyncio.sleep(LIVE_POLL_SECONDS)
+
+
+async def detect_loop(duka, instrument, state, tg, cache, lock):
+    """كل DETECT_POLL_SECONDS: جلب كامل 18 ساعة واكتشاف إشارات جديدة."""
+    while not STOP_REQUESTED:
+        try:
+            bid, ask = await asyncio.gather(
+                asyncio.to_thread(fetch_1m, duka, instrument, "BID"),
+                asyncio.to_thread(fetch_1m, duka, instrument, "ASK"),
+            )
+            async with lock:
+                cache["bid"] = merge_tail(cache.get("bid"), bid)
+                cache["ask"] = merge_tail(cache.get("ask"), ask)
+                for tr in detect_setups(cache["bid"], cache["ask"], state):
+                    await register_signal(state, tr, tg)
+        except Exception as exc:
+            log.warning("Detect cycle failed (will retry): %r", exc)
+        await nap(DETECT_POLL_SECONDS)
+
+
 async def main_loop():
     await start_web_server()
     duka, instrument = get_duka()
@@ -372,31 +488,21 @@ async def main_loop():
         state["started_message_sent"] = True
         save_state(state)
 
-    while not STOP_REQUESTED:
-        try:
-            bid = fetch_1m(duka, instrument, "BID")
-            ask = fetch_1m(duka, instrument, "ASK")
-            m5 = resample(bid, 5)
-            await manage_trades(state, bid, ask, m5, tg)
-            for tr in detect_setups(bid, ask, state):
-                msg_id = await tg.send(pending_text(tr))
-                tr["message_id"] = msg_id
-                state["signals"][tr["key"]] = {"created": tr["created_at"], "status": "pending"}
-                state["active"][tr["key"]] = tr
-                save_state(state)
-                log.info("New pending %s %s", tr["key"], tr["entry"])
-        except Exception as exc:
-            log.warning("Polling cycle failed (will retry): %r", exc)
-        for _ in range(POLL_SECONDS):
-            if STOP_REQUESTED:
-                break
-            await asyncio.sleep(1)
+    cache: dict[str, pd.DataFrame] = {}
+    lock = asyncio.Lock()
+    await asyncio.gather(
+        live_loop(duka, instrument, state, tg, cache, lock),
+        detect_loop(duka, instrument, state, tg, cache, lock),
+    )
     save_state(state)
     await tg.close()
 
 
-async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame, m5: pd.DataFrame, tg: TelegramSender):
+async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame, m5: pd.DataFrame,
+                        tg: TelegramSender, prices: Optional[dict[str, float]] = None):
     now = pd.Timestamp.now(tz="UTC")
+    fl = now.floor("1min")
+    one_min = pd.Timedelta(minutes=1)
     remove = []
     for key, tr in list(state.get("active", {}).items()):
         if tr.get("status") in ("closed", "cancelled"):
@@ -404,6 +510,8 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
             continue
         side = tr["side"]
         trigger = bid if side == "sell" else ask
+        price = (prices or {}).get("bid" if side == "sell" else "ask")
+        reply_to = tr.get("message_id")
         confirm = pd.Timestamp(tr["confirm_time"])
         if confirm.tzinfo is None:
             confirm = confirm.tz_localize("UTC")
@@ -413,83 +521,84 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
             expiry = expiry.tz_localize("UTC")
 
         if tr["status"] == "pending":
-            q = trigger[(trigger.index >= active_start) & (trigger.index < expiry)]
-            hit = q[q.high >= tr["entry"]] if side == "sell" else q[q.low <= tr["entry"]]
-            p1_time = hit.index[0] if len(hit) else None
-            if p1_time is not None:
-                tr["status"] = "active"
-                tr["entry_time"] = p1_time.isoformat()
-                tr["entry_source"] = "P1"
-                await tg.send(activated_text(tr))
-                save_state(state)
+            when = touch_time(side, tr["entry"], trigger, price, active_start, expiry, now)
+            if when is not None:
+                await activate(state, tr, "P1", when, tg)
                 continue
-            if now >= active_start + pd.Timedelta(minutes=FVG_DELAY_MINUTES) and tr.get("fvg_order") is None:
+            if now >= active_start + pd.Timedelta(minutes=FVG_DELAY_MINUTES) and tr.get("fvg_order") is None and not tr.get("fvg_checked"):
                 tr["fvg_order"] = make_fvg_order(tr, bid, m5)
                 tr["fvg_checked"] = True
                 save_state(state)
             fvg = tr.get("fvg_order")
             if fvg:
-                fq = trigger[(trigger.index >= pd.Timestamp(fvg["formed"]) + pd.Timedelta(minutes=5)) & (trigger.index < expiry)]
-                hit2 = fq[fq.high >= fvg["entry"]] if side == "sell" else fq[fq.low <= fvg["entry"]]
-                if len(hit2):
+                fstart = pd.Timestamp(fvg["formed"]) + pd.Timedelta(minutes=5)
+                when2 = touch_time(side, fvg["entry"], trigger, price, fstart, expiry, now)
+                if when2 is not None:
                     tr["entry"] = fvg["entry"]
                     tr["stop"] = fvg["stop"]
                     tr["targets"] = fvg["targets"]
-                    tr["status"] = "active"
-                    tr["entry_time"] = hit2.index[0].isoformat()
-                    tr["entry_source"] = "P2-FVG"
-                    await tg.send(activated_text(tr))
-                    save_state(state)
+                    await activate(state, tr, "P2-FVG", when2, tg)
                     continue
             if now >= expiry:
                 tr["status"] = "cancelled"
                 await tg.edit_cancelled(tr.get("message_id"), cancelled_text(tr))
-                state["signals"][key]["status"] = "cancelled"
+                if key in state["signals"]:
+                    state["signals"][key]["status"] = "cancelled"
                 save_state(state)
                 remove.append(key)
+
         elif tr["status"] == "active":
-            entry_time = pd.Timestamp(tr["entry_time"])
-            q = trigger[trigger.index >= entry_time]
-            if q.empty:
-                continue
+            entry_dt = pd.Timestamp(tr["entry_time"])
+            ent_min = entry_dt.floor("1min")
+            cl = trigger[(trigger.index > ent_min) & (trigger.index + one_min <= fl)]
+            best = float(tr.get("best", tr["entry"]))
             if side == "sell":
-                favorable = float(q.low.min())
-                move = tr["entry"] - favorable
+                if len(cl):
+                    best = min(best, float(cl.low.min()))
+                if price is not None:
+                    best = min(best, price)
+                stopped = (len(cl) and float(cl.high.max()) >= tr["stop"]) or (price is not None and price >= tr["stop"])
+                move = tr["entry"] - best
             else:
-                favorable = float(q.high.max())
-                move = favorable - tr["entry"]
-            points = max(0, int(round(move * 10)))
-            stopped = False
-            for ts, bar in q.iterrows():
-                if (side == "sell" and float(bar.high) >= tr["stop"]) or (side == "buy" and float(bar.low) <= tr["stop"]):
-                    stopped = True
-                    break
+                if len(cl):
+                    best = max(best, float(cl.high.max()))
+                if price is not None:
+                    best = max(best, price)
+                stopped = (len(cl) and float(cl.low.min()) <= tr["stop"]) or (price is not None and price <= tr["stop"])
+                move = best - tr["entry"]
+            tr["best"] = best
+
             if stopped:
+                # إغلاق صامت: لا رسالة وقف، فقط توقف المتابعة
                 tr["status"] = "closed"
                 tr["close_reason"] = "SL"
-                await tg.send(f"🛑 الصفقة أغلقت على الوقف\n🥇 XAUUSD {side_word(side)}\n📍 الوقف: {fmt_price(tr['stop'])}")
+                if key in state["signals"]:
+                    state["signals"][key]["status"] = "closed_sl"
                 save_state(state)
                 remove.append(key)
                 continue
+
+            points = max(0, int(round(move * 10)))
             for n, target in enumerate(tr["targets"], 1):
-                touched = favorable <= target if side == "sell" else favorable >= target
+                touched = best <= target if side == "sell" else best >= target
                 if touched and n not in tr["hit_tps"]:
                     tr["hit_tps"].append(n)
-                    await tg.send(tp_text(tr, n, signed_points(abs(target - tr["entry"]), "buy")))
+                    await tg.send(tp_text(tr, n, signed_points(abs(target - tr["entry"]), "buy")), reply_to=reply_to)
                     save_state(state)
             start_pts = int(round(PROGRESS_START * 10))
             step_pts = int(round(PROGRESS_STEP * 10))
             if points >= start_pts:
-                # المراحل: 30 ثم 50 ثم 70 ثم 90 ثم 110 ...
                 milestone = start_pts + ((points - start_pts) // step_pts) * step_pts
                 if milestone > tr.get("last_progress", 0):
                     tr["last_progress"] = milestone
-                    await tg.send(progress_text(tr, milestone))
+                    await tg.send(progress_text(tr, milestone), reply_to=reply_to)
                     save_state(state)
             if len(tr["hit_tps"]) == len(tr["targets"]):
-                await tg.send(all_targets_text(tr))
+                await tg.send(all_targets_text(tr), reply_to=reply_to)
                 tr["status"] = "closed"
                 tr["close_reason"] = "ALL_TP"
+                if key in state["signals"]:
+                    state["signals"][key]["status"] = "closed_tp"
                 save_state(state)
                 remove.append(key)
     for key in remove:
