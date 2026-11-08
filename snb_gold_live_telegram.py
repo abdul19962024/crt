@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SNB GOLD LIVE — H2 edge + M5 confirmation + optional M5 FVG Entry 2
+SNB GOLD LIVE — H2 edge + M5 confirmation + Closer re-entry (P2)
 نسخة للنشر على Render: الإعدادات السرية تُقرأ من Environment Variables.
 هذا كود إشارات فقط وليس مستشاراً مالياً.
 """
@@ -20,7 +20,6 @@ import pandas as pd
 from aiohttp import web
 
 # ========================= USER SETTINGS =========================
-# تُقرأ من متغيرات البيئة (Render -> Environment). للتشغيل المحلي ضعها في PowerShell.
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
@@ -30,7 +29,7 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 DATA_DIR = Path(os.getenv("SNB_DATA_DIR", str(Path.home() / "snb_live_data")))
 STATE_FILE = DATA_DIR / "snb_gold_live_state.json"
 LIVE_POLL_SECONDS = 3        # فحص السعر اللحظي للصفقات (كل 3 ثوانٍ)
-DETECT_POLL_SECONDS = 5      # البحث عن إشارات جديدة (جلب 18 ساعة كما كان)
+DETECT_POLL_SECONDS = 5      # البحث عن إشارات جديدة
 LIVE_WINDOW_MINUTES = 15     # نافذة الجلب الخفيف للمتابعة اللحظية
 LOOKBACK_HOURS = 18
 TIMEZONE = "Asia/Riyadh"
@@ -45,6 +44,12 @@ PENDING_EXPIRY_HOURS = 2
 SIGNAL_MAX_AGE_MINUTES = 10   # تجاهل الإشارات الأقدم من هذا (يمنع إشارات قديمة بعد إعادة التشغيل)
 FVG_DELAY_MINUTES = 10
 FVG_STOP_DISTANCE = 1.00
+
+# ---- الأمر الأقرب (P2) ----
+PENDING_CANCEL_MINUTES = 10   # إذا لم يتفعل الأمر المعلق خلال هذه المدة يُلغى (برد) ونبحث عن مكان أقرب
+CLOSER_OFFSET = 0.50          # الأمر الجديد أقرب بنصف دولار من نقطة التساوي
+CLOSER_STOP = 3.00            # وقف الأمر الجديد: 30 بيب = 3$ من الدخول
+USE_FVG = False               # الأمر الأقرب يحل محل FVG
 
 NO_NEW_FIRST_HOUR = True
 NO_NEW_LAST_HOUR = True
@@ -263,6 +268,15 @@ def cancelled_text(tr: dict[str, Any]) -> str:
     )
 
 
+def waiting_text(tr: dict[str, Any]) -> str:
+    return (
+        "❌ **تم إلغاء الأمر المعلق**\n\n"
+        f"🥇 XAUUSD | {side_word(tr['side'])}\n"
+        f"📍 المستوى: {fmt_price(tr['entry'])}\n"
+        "⏳ **انتظر**، ممكن ناخذها من مكان أقرب 👀"
+    )
+
+
 def all_targets_text(tr: dict[str, Any]) -> str:
     total = signed_points(tr["targets"][-1] - tr["entry"] if tr["side"] == "buy" else tr["entry"] - tr["targets"][-1], "buy")
     return f"🏆🏆🏆 **تحققت جميع الأهداف** 🎯🎯🎯\n🥇 XAUUSD {side_word(tr['side'])}\n💰 إجمالي: **+{total} نقطة** 🔥💎👑"
@@ -285,8 +299,6 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
     if len(h2) < 3 or len(m5) < 5:
         return setups
 
-    # كل شمعة H2 مغلقة (بما فيها الأخيرة): نافذة التأكيد تبدأ بعد إغلاقها مباشرة.
-    # نفحص الشموع المتاحة فقط (M5 المغلقة)، فتُكتشف الإشارة لحظة تأكدها دون انتظار نهاية النافذة.
     for i in range(2, len(h2)):
         hs = h2.index[i]
         hb = h2.iloc[i]
@@ -300,8 +312,6 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
             lower = min(float(first.low), float(second.low)) <= float(hb.low)
             equal = (float(first.close) + float(second.open)) / 2
             near = abs(float(first.close) - float(second.open)) <= MAX_EQUAL_GAP
-            # القاعدة الموسّعة: يكفي أن تلمس إحدى الشمعتين حافة H2؛
-            # لا يُشترط أن يغلق إغلاق الشمعة الثانية داخل نطاق H2.
             sell = upper and near and first.close > first.open and second.close < second.open
             buy = lower and near and first.close < first.open and second.close > second.open
             if not (sell or buy):
@@ -310,7 +320,6 @@ def detect_setups(bid: pd.DataFrame, ask: pd.DataFrame, state: dict[str, Any]) -
             key = signal_key(hs, side)
             if key in state["signals"]:
                 break
-            # إشارة قديمة (مثلاً بعد إعادة تشغيل ضاعت فيها الحالة): لا ترسلها
             if now_utc - (confirm_time + pd.Timedelta(minutes=5)) > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
                 continue
             raw_stop = max(float(first.high), float(second.high)) + RAW_STOP_BUFFER if sell else min(float(first.low), float(second.low)) - RAW_STOP_BUFFER
@@ -362,6 +371,51 @@ def make_fvg_order(tr: dict[str, Any], bid: pd.DataFrame, m5: pd.DataFrame) -> O
     return None
 
 
+def find_closer(tr: dict[str, Any], m5: pd.DataFrame) -> Optional[dict[str, Any]]:
+    """
+    الأمر الأقرب (P2) بعد إلغاء الأمر الأول:
+      شراء: شمعتا M5 متتاليتان خضراوان، وفارق (إغلاق الأولى - افتتاح الثانية) <= 0.10
+            الأمر عند نقطة التساوي + 0.50، والوقف = الدخول - 3.00
+      بيع : العكس (حمراوان، الأمر عند التساوي - 0.50، الوقف = الدخول + 3.00)
+    """
+    side = tr["side"]
+    since = pd.Timestamp(tr["wait_since"]).ceil("5min")
+    expiry = pd.Timestamp(tr["expiry"])
+    q = m5[m5.index >= since]
+    for j in range(1, len(q)):
+        a, b = q.iloc[j - 1], q.iloc[j]
+        if q.index[j] - q.index[j - 1] != pd.Timedelta(minutes=5):
+            continue
+        if q.index[j] + pd.Timedelta(minutes=5) >= expiry:
+            break
+        if side == "buy":
+            same_color = a.close > a.open and b.close > b.open
+        else:
+            same_color = a.close < a.open and b.close < b.open
+        if not same_color or abs(float(a.close) - float(b.open)) > MAX_EQUAL_GAP:
+            continue
+
+        equal = (float(a.close) + float(b.open)) / 2
+        if side == "buy":
+            entry = equal + CLOSER_OFFSET
+            stop = entry - CLOSER_STOP
+        else:
+            entry = equal - CLOSER_OFFSET
+            stop = entry + CLOSER_STOP
+
+        confirm_time = q.index[j]
+        return {
+            "key": f"{tr['key']}|P2", "side": side, "leg": "P2",
+            "h2_start": tr["h2_start"], "confirm_time": confirm_time.isoformat(),
+            "entry": round(entry, 3), "stop": round(stop, 3),
+            "targets": build_targets(entry, side),
+            "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            "expiry": tr["expiry"], "message_id": None, "status": "pending",
+            "last_progress": 0, "hit_tps": [], "fvg_checked": True, "fvg_order": None,
+        }
+    return None
+
+
 # ========================= LIVE ENGINE =========================
 def opposite(side: str) -> str:
     return "buy" if side == "sell" else "sell"
@@ -403,6 +457,10 @@ async def cancel_opposites(state: dict[str, Any], side: str, tg: "TelegramSender
             await tg.edit_cancelled(t.get("message_id"), cancelled_text(t))
             if k in state["signals"]:
                 state["signals"][k]["status"] = "cancelled_opposite"
+        elif t.get("status") == "waiting" and t["side"] == opposite(side):
+            t["status"] = "cancelled"
+            if k in state["signals"]:
+                state["signals"][k]["status"] = "cancelled_opposite"
 
 
 async def activate(state: dict[str, Any], tr: dict[str, Any], source: str, when: pd.Timestamp, tg: "TelegramSender") -> None:
@@ -423,9 +481,9 @@ async def nap(seconds: int) -> None:
 
 
 async def register_signal(state: dict[str, Any], tr: dict[str, Any], tg: "TelegramSender") -> None:
-    """إشارة جديدة: تُغلق بصمت أي صفقة نشطة معاكسة لها، ثم تُرسل وتُتابع. نفس الاتجاه: الاثنتان تُتابعان."""
+    """إشارة جديدة: تُغلق بصمت أي صفقة نشطة/منتظِرة معاكسة لها، ثم تُرسل وتُتابع."""
     for k, t in state["active"].items():
-        if t.get("status") == "active" and t["side"] == opposite(tr["side"]):
+        if t.get("status") in ("active", "waiting") and t["side"] == opposite(tr["side"]):
             t["status"] = "closed"
             t["close_reason"] = "REVERSED"
             if k in state["signals"]:
@@ -440,10 +498,10 @@ async def register_signal(state: dict[str, Any], tr: dict[str, Any], tg: "Telegr
 
 
 async def live_loop(duka, instrument, state, tg, cache, lock):
-    """كل LIVE_POLL_SECONDS: سعر لحظي للصفقات المعلقة والنشطة (نفس مكتبة Dukascopy)."""
+    """كل LIVE_POLL_SECONDS: سعر لحظي للصفقات المعلقة والنشطة والمنتظِرة."""
     while not STOP_REQUESTED:
         try:
-            if any(t.get("status") in ("pending", "active") for t in state["active"].values()):
+            if any(t.get("status") in ("pending", "active", "waiting") for t in state["active"].values()):
                 sb, sa = await asyncio.gather(
                     asyncio.to_thread(fetch_1m, duka, instrument, "BID", LIVE_WINDOW_MINUTES / 60),
                     asyncio.to_thread(fetch_1m, duka, instrument, "ASK", LIVE_WINDOW_MINUTES / 60),
@@ -524,22 +582,37 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
         if tr["status"] == "pending":
             when = touch_time(side, tr["entry"], trigger, price, active_start, expiry, now)
             if when is not None:
-                await activate(state, tr, "P1", when, tg)
+                await activate(state, tr, tr.get("leg", "P1"), when, tg)
                 continue
-            if now >= active_start + pd.Timedelta(minutes=FVG_DELAY_MINUTES) and tr.get("fvg_order") is None and not tr.get("fvg_checked"):
-                tr["fvg_order"] = make_fvg_order(tr, bid, m5)
-                tr["fvg_checked"] = True
+
+            # مرّت 10 دقائق ولم يتفعل: نردّ على الرسالة (بدون حذفها أو تعديلها) وننتقل للانتظار
+            created = pd.Timestamp(tr["created_at"])
+            if created.tzinfo is None:
+                created = created.tz_localize("UTC")
+            if tr.get("leg", "P1") == "P1" and now >= created + pd.Timedelta(minutes=PENDING_CANCEL_MINUTES):
+                tr["status"] = "waiting"
+                tr["wait_since"] = now.isoformat()
+                await tg.send(waiting_text(tr), reply_to=tr.get("message_id"))
+                if key in state["signals"]:
+                    state["signals"][key]["status"] = "cancelled_wait"
                 save_state(state)
-            fvg = tr.get("fvg_order")
-            if fvg:
-                fstart = pd.Timestamp(fvg["formed"]) + pd.Timedelta(minutes=5)
-                when2 = touch_time(side, fvg["entry"], trigger, price, fstart, expiry, now)
-                if when2 is not None:
-                    tr["entry"] = fvg["entry"]
-                    tr["stop"] = fvg["stop"]
-                    tr["targets"] = fvg["targets"]
-                    await activate(state, tr, "P2-FVG", when2, tg)
-                    continue
+                continue
+
+            if USE_FVG:
+                if now >= active_start + pd.Timedelta(minutes=FVG_DELAY_MINUTES) and tr.get("fvg_order") is None and not tr.get("fvg_checked"):
+                    tr["fvg_order"] = make_fvg_order(tr, bid, m5)
+                    tr["fvg_checked"] = True
+                    save_state(state)
+                fvg = tr.get("fvg_order")
+                if fvg:
+                    fstart = pd.Timestamp(fvg["formed"]) + pd.Timedelta(minutes=5)
+                    when2 = touch_time(side, fvg["entry"], trigger, price, fstart, expiry, now)
+                    if when2 is not None:
+                        tr["entry"] = fvg["entry"]
+                        tr["stop"] = fvg["stop"]
+                        tr["targets"] = fvg["targets"]
+                        await activate(state, tr, "P2-FVG", when2, tg)
+                        continue
             if now >= expiry:
                 tr["status"] = "cancelled"
                 await tg.edit_cancelled(tr.get("message_id"), cancelled_text(tr))
@@ -547,6 +620,21 @@ async def manage_trades(state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFr
                     state["signals"][key]["status"] = "cancelled"
                 save_state(state)
                 remove.append(key)
+
+        elif tr["status"] == "waiting":
+            if now >= expiry:
+                tr["status"] = "cancelled"
+                if key in state["signals"]:
+                    state["signals"][key]["status"] = "cancelled"
+                save_state(state)
+                remove.append(key)
+                continue
+            new_tr = find_closer(tr, m5)
+            if new_tr is not None and new_tr["key"] not in state["signals"]:
+                tr["status"] = "closed"
+                tr["close_reason"] = "REPLACED"
+                remove.append(key)
+                await register_signal(state, new_tr, tg)   # يرسل أمراً معلقاً جديداً
 
         elif tr["status"] == "active":
             entry_dt = pd.Timestamp(tr["entry_time"])
