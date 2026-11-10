@@ -413,6 +413,16 @@ def stop_text(trade: dict[str, Any]) -> str:
     )
 
 
+def opposite_tracking_text(trade: dict[str, Any]) -> str:
+    return (
+        "⏹️ **توقفت متابعة الصفقة بسبب ظهور إشارة معاكسة**\n\n"
+        f"📌 الصفقة التي توقفت متابعتها: **{side_ar(trade['side'])}**\n"
+        f"🆕 الإشارة الجديدة: **{side_ar(trade['opposite_signal_side'])}** عند **{fmt_price(trade['opposite_signal_entry'])}**\n"
+        f"💵 السعر المرجعي وقت إيقاف المتابعة: **{fmt_price(trade['tracking_stop_reference_price'])}**\n\n"
+        "هذا يوقف متابعة البوت للصفقة القديمة فقط؛ لا يغلقها ولا يرسل أمرًا إلى الوسيط."
+    )
+
+
 def legacy_progress_text(trade: dict[str, Any], dollars: float) -> str:
     return progress_text(trade, dollars)
 
@@ -436,6 +446,47 @@ async def notify_entry(trade: dict[str, Any], state: dict[str, Any], tg: Telegra
         trade["notification_attempted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
         save_state(state)
         log.exception("Telegram signal send failed; it will be retried.")
+
+
+async def notify_tracking_stopped(trade: dict[str, Any], state: dict[str, Any], tg: TelegramSender) -> None:
+    if trade.get("opposite_notification_status") in ("sent", "preview"):
+        return
+    try:
+        message_id = await tg.send(opposite_tracking_text(trade), reply_to=trade.get("message_id"))
+        trade["opposite_notification_status"] = "preview" if message_id is None else "sent"
+        trade["opposite_notification_attempted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+        save_state(state)
+    except Exception:
+        trade["opposite_notification_status"] = "pending_retry"
+        trade["opposite_notification_attempted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+        save_state(state)
+        log.exception("Could not notify that tracking stopped for trade %s", trade.get("key"))
+
+
+async def stop_opposite_tracking(new_trade: dict[str, Any], quote: dict[str, Any], state: dict[str, Any], tg: TelegramSender) -> None:
+    stopped = []
+    now = as_utc(quote["received_at"]).isoformat()
+    for trades in (state.get("trades", {}), state.get("legacy_trades", {})):
+        for old_trade in trades.values():
+            if old_trade.get("status") != "active" or old_trade.get("side") == new_trade["side"]:
+                continue
+            old_side = old_trade["side"]
+            old_trade["status"] = "tracking_stopped_opposite"
+            old_trade["close_reason"] = "OPPOSITE_SIGNAL"
+            old_trade["closed_at"] = now
+            old_trade["replacement_trade_key"] = new_trade["key"]
+            old_trade["opposite_signal_side"] = new_trade["side"]
+            old_trade["opposite_signal_entry"] = new_trade["entry"]
+            old_trade["tracking_stop_reference_price"] = round(float(quote["bid"] if old_side == "buy" else quote["ask"]), 3)
+            old_trade["opposite_notification_status"] = "pending"
+            old_trade["opposite_notification_attempted_at"] = None
+            stopped.append(old_trade)
+
+    if stopped:
+        save_state(state)
+        log.info("Stopped tracking %s active opposite-direction trade(s) after new %s signal.", len(stopped), new_trade["side"])
+        for old_trade in stopped:
+            await notify_tracking_stopped(old_trade, state, tg)
 
 
 async def activate_zone(zone: dict[str, Any], quote: dict[str, Any], state: dict[str, Any], tg: TelegramSender) -> None:
@@ -479,6 +530,7 @@ async def activate_zone(zone: dict[str, Any], quote: dict[str, Any], state: dict
     state["trades"][key] = trade
     save_state(state)
     log.info("M30 zone touched: side=%s level=%s entry=%s at=%s", trade["side"], trade["zone_level"], trade["entry"], fmt_time(touched_at))
+    await stop_opposite_tracking(trade, quote, state, tg)
     await notify_entry(trade, state, tg)
 
 
@@ -538,13 +590,16 @@ async def manage_open_trades(state: dict[str, Any], quote: dict[str, Any], tg: T
 
 async def retry_unsent_notifications(state: dict[str, Any], tg: TelegramSender) -> None:
     now = pd.Timestamp.now(tz="UTC")
-    for trade in state.get("trades", {}).values():
-        if trade.get("status") != "active" or trade.get("notification_status") != "pending_retry":
-            continue
-        attempted = trade.get("notification_attempted_at")
-        if attempted and (now - as_utc(attempted)).total_seconds() < 15:
-            continue
-        await notify_entry(trade, state, tg)
+    for trades in (state.get("trades", {}), state.get("legacy_trades", {})):
+        for trade in trades.values():
+            if trade.get("status") == "active" and trade.get("notification_status") == "pending_retry":
+                attempted = trade.get("notification_attempted_at")
+                if not attempted or (now - as_utc(attempted)).total_seconds() >= 15:
+                    await notify_entry(trade, state, tg)
+            if trade.get("status") == "tracking_stopped_opposite" and trade.get("opposite_notification_status") in ("pending", "pending_retry"):
+                attempted = trade.get("opposite_notification_attempted_at")
+                if not attempted or (now - as_utc(attempted)).total_seconds() >= 15:
+                    await notify_tracking_stopped(trade, state, tg)
 
 
 # ---------------- Quote bridge / zone scanning ----------------
