@@ -2,4 +2,5 @@ telethon
 aiohttp
 pandas
 requests
-dukascopy-python<5
+websocket-client
+git+https://github.com/rongardF/tvdatafeed.git
