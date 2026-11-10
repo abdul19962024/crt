@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-SNB LIVE — XAUUSD + NAS100 (كل رمز مستقل تماماً عن الآخر)
-H2 edge + M5 confirmation + Closer re-entry (P2)
-الإعدادات السرية تُقرأ من Environment Variables.
-هذا كود إشارات فقط وليس مستشاراً مالياً.
+"""SNB GOLD LIVE — M30 equal-point zones + live FX_IDC:XAUUSD quotes.
+
+Historical M30 candles: Python tvdatafeed (FX_IDC:XAUUSD).
+Live touch/position tracking: @mathieuc/tradingview watchQuotes via Node bridge.
+Telegram alerts only; this program never sends or places broker orders.
 """
 from __future__ import annotations
 
@@ -13,118 +13,134 @@ import json
 import logging
 import os
 import signal
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 from aiohttp import web
 
-# ========================= USER SETTINGS =========================
+# ---------------- Configuration ----------------
+TZ = os.getenv("TIMEZONE", "Asia/Riyadh")
+SYMBOL = "FX_IDC:XAUUSD"  # This bot is intentionally gold-only.
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
-TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "@GoldBlackFx")
+TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "")
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 
-DATA_DIR = Path(os.getenv("SNB_DATA_DIR", str(Path.home() / "snb_live_data")))
-STATE_FILE = DATA_DIR / "snb_gold_live_state.json"
-LIVE_POLL_SECONDS = 3
-DETECT_POLL_SECONDS = 5
-LIVE_WINDOW_MINUTES = 15
-LOOKBACK_HOURS = 18
-TIMEZONE = "Asia/Riyadh"
+DATA_DIR = Path(os.getenv("SNB_DATA_DIR", str(Path.home() / "snb_gold_data")))
+STATE_FILE = DATA_DIR / "snb_gold_state.json"
+STRATEGY_VERSION = "m30_equalpoint_touch_live_v1"
+HISTORY_BARS = int(os.getenv("HISTORY_BARS", "300"))
+HISTORY_REFRESH_SECONDS = int(os.getenv("HISTORY_REFRESH_SECONDS", "30"))
+QUOTE_STALE_SECONDS = int(os.getenv("QUOTE_STALE_SECONDS", "30"))
+LATE_TOUCH_MAX_SECONDS = int(os.getenv("LATE_TOUCH_MAX_SECONDS", "120"))
+QUOTE_BUFFER_SIZE = int(os.getenv("QUOTE_BUFFER_SIZE", "10000"))
+EQUAL_TOLERANCE = float(os.getenv("EQUAL_TOLERANCE", "0.10"))
+FIXED_STOP_DOLLARS = float(os.getenv("FIXED_STOP_DOLLARS", "4.0"))
+PROGRESS_START_DOLLARS = float(os.getenv("PROGRESS_START_DOLLARS", "3.0"))
+PROGRESS_STEP_DOLLARS = float(os.getenv("PROGRESS_STEP_DOLLARS", "2.0"))
+POINTS_PER_DOLLAR = 10
 
-# الرموز المفعّلة (يمكن تغييرها من Render: SNB_SYMBOLS=XAUUSD,NAS100)
-ENABLED_SYMBOLS = [s.strip().upper() for s in os.getenv("SNB_SYMBOLS", "XAUUSD,NAS100").split(",") if s.strip()]
+BASE_DIR = Path(__file__).resolve().parent
+QUOTE_BRIDGE = BASE_DIR / "snb_tv_quote_bridge.mjs"
+STARTUP_MESSAGE = "اللهم صلِّ وسلِّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️"
 
-# ---------- إعدادات مشتركة ----------
-PENDING_EXPIRY_HOURS = 2
-SIGNAL_MAX_AGE_MINUTES = 10
-FVG_DELAY_MINUTES = 10
-PENDING_CANCEL_MINUTES = 10
-USE_FVG = False
-NO_NEW_FIRST_HOUR = True
-NO_NEW_LAST_HOUR = True
-
-# ---------- إعدادات كل رمز ----------
-# pt = مضاعف تحويل حركة السعر إلى "نقاط" في الرسائل (الذهب: 0.1$ = نقطة، الناسداك: 1 = نقطة)
-# قيم الناسداك = قيم الذهب × 10 كبداية، عدّلها حسب رغبتك.
-CONFIGS: dict[str, dict[str, Any]] = {
-    "XAUUSD": {
-        "instrument_attr": "INSTRUMENT_FX_METALS_XAU_USD",
-        "label": "🥇 XAUUSD",
-        "name": "XAUUSD",
-        "pt": 10,
-        "max_equal_gap": 0.10,
-        "pending_offset": 1.00,
-        "min_stop": 3.00,
-        "raw_stop_buffer": 0.10,
-        "closer_offset": 0.50,
-        "closer_stop": 3.00,
-        "fvg_stop": 1.00,
-        "tp_offsets": [7.0, 10.0, 17.0, 20.0, 35.0],
-        "progress_start": 3.0,
-        "progress_step": 2.0,
-    },
-    "NAS100": {
-        "instrument_attr": "INSTRUMENT_IDX_AMERICA_E_NQ_100",   # E_NQ-100
-        "label": "📊 NASDAQ",
-        "name": "NAS100",
-        "pt": 1,
-        "max_equal_gap": 1.0,
-        "pending_offset": 10.0,
-        "min_stop": 30.0,
-        "raw_stop_buffer": 1.0,
-        "closer_offset": 5.0,
-        "closer_stop": 30.0,
-        "fvg_stop": 10.0,
-        "tp_offsets": [70.0, 100.0, 170.0, 200.0, 350.0],
-        "progress_start": 30.0,
-        "progress_step": 20.0,
-    },
-}
-
-# ========================= LOGGING =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("snb")
+log = logging.getLogger("snb-gold-m30-live")
 STOP_REQUESTED = False
+HEALTH: dict[str, Any] = {
+    "status": "starting",
+    "symbol": SYMBOL,
+    "historical_source": "tvdatafeed / FX_IDC:XAUUSD / M30",
+    "live_source": "@mathieuc/tradingview watchQuotes / FX_IDC:XAUUSD",
+    "live_quote_connected": False,
+    "last_quote_received_utc": None,
+    "last_quote_time_utc": None,
+    "last_lp": None,
+    "bid": None,
+    "ask": None,
+    "active_zones": 0,
+    "active_trades": 0,
+}
 
 
 def stop_handler(signum, frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
-    log.info("Stop requested; active trades will be saved.")
+    log.info("Stop requested; saving state and stopping live quote stream.")
 
 
 signal.signal(signal.SIGINT, stop_handler)
 signal.signal(signal.SIGTERM, stop_handler)
 
 
-# ========================= WEB SERVER =========================
-async def home(request):
-    return web.json_response({"status": "ok", "symbols": ENABLED_SYMBOLS})
+# ---------------- Health endpoint ----------------
+async def health(_request):
+    snapshot = dict(HEALTH)
+    snapshot["status"] = "ok" if snapshot.get("live_quote_connected") else "waiting_for_live_quote"
+    return web.json_response(snapshot)
 
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get("/", home)
-    app.router.add_get("/healthz", home)
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info("Web server running on port %s", port)
+    log.info("Health server listening on port %s", port)
 
 
-# ========================= STATE =========================
+# ---------------- Persistent state ----------------
+def empty_state() -> dict[str, Any]:
+    return {
+        "strategy_version": STRATEGY_VERSION,
+        "zones": {},
+        "trades": {},
+        "legacy_trades": {},
+        "archived_trades": {},
+    }
+
+
 def load_state() -> dict[str, Any]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            log.exception("Could not read state; starting clean state.")
-    return {"started_message_sent": False, "signals": {}, "active": {}}
+    if not STATE_FILE.exists():
+        return empty_state()
+    try:
+        old = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("State file is invalid; starting a new strategy state.")
+        return empty_state()
+
+    if old.get("strategy_version") != STRATEGY_VERSION:
+        state = empty_state()
+        old_trades = old.get("trades", {}) or {}
+        for key, trade in old_trades.items():
+            if trade.get("status") == "active" and trade.get("entry") is not None and trade.get("stop") is not None:
+                trade["legacy_strategy"] = trade.get("entry_source", "previous_strategy")
+                state["legacy_trades"][key] = trade
+            else:
+                state["archived_trades"][key] = trade
+        # Carry forward already-active positions for stop/progress monitoring only;
+        # no new H1/M2 signals or retries are generated by this version.
+        log.warning(
+            "Strategy state migrated to M30. Carrying %s previously active trades for monitoring only; archived %s inactive records.",
+            len(state["legacy_trades"]), len(state["archived_trades"]),
+        )
+        save_state(state)
+        return state
+
+    state = empty_state()
+    state.update(old)
+    state.setdefault("zones", {})
+    state.setdefault("trades", {})
+    state.setdefault("legacy_trades", {})
+    state.setdefault("archived_trades", {})
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -134,621 +150,692 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
-def sym_of(tr: dict[str, Any]) -> str:
-    return tr.get("sym", "XAUUSD")   # الصفقات القديمة بدون sym = ذهب
+# ---------------- Time / prices ----------------
+def as_utc(value: Any) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 
-# ========================= DATA =========================
-def get_duka():
+def local(ts: Any) -> pd.Timestamp:
+    return as_utc(ts).tz_convert(TZ)
+
+
+def local_day(ts: Any) -> str:
+    return local(ts).date().isoformat()
+
+
+def fmt_time(ts: Any) -> str:
+    return local(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_price(value: float) -> str:
+    return f"{float(value):.3f}"
+
+
+def next_local_midnight_utc(ts: Any) -> pd.Timestamp:
+    local_ts = local(ts)
+    next_day = local_ts.normalize() + pd.Timedelta(days=1)
+    return next_day.tz_convert("UTC")
+
+
+def side_ar(side: str) -> str:
+    return "شراء" if side == "buy" else "بيع"
+
+
+def entry_triggered(zone: dict[str, Any], quote: dict[str, Any]) -> bool:
+    if zone["side"] == "buy":
+        return float(quote["ask"]) <= float(zone["level"])
+    return float(quote["bid"]) >= float(zone["level"])
+
+
+def quote_is_pre_touch(zone: dict[str, Any], quote: dict[str, Any]) -> bool:
+    if zone["side"] == "buy":
+        return float(quote["ask"]) > float(zone["level"])
+    return float(quote["bid"]) < float(zone["level"])
+
+
+# ---------------- Historical M30 candles: old Python tvdatafeed ----------------
+def normalize_history(data: pd.DataFrame) -> pd.DataFrame:
+    if data is None or data.empty:
+        raise RuntimeError("TvDatafeed returned no M30 history for FX_IDC:XAUUSD")
+    out = data.copy()
+    out.columns = [str(c).lower() for c in out.columns]
+    required = ["open", "high", "low", "close"]
+    if any(col not in out.columns for col in required):
+        raise RuntimeError(f"TvDatafeed is missing OHLC columns: {list(out.columns)}")
+    idx = pd.DatetimeIndex(pd.to_datetime(out.index))
+    # Verified with the no-login FX_IDC feed: its naive chart index is UTC.
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    out.index = idx
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=required)
+    if len(out) < 3:
+        raise RuntimeError(f"Only {len(out)} usable M30 candles returned")
+    return out
+
+
+def fetch_m30_history() -> pd.DataFrame:
+    """Fetch chart history only. Live touches and trade monitoring use watchQuotes."""
+    from tvDatafeed import TvDatafeed, Interval
+
+    for attempt in range(1, 4):
+        tv = None
+        try:
+            tv = TvDatafeed()
+            data = tv.get_hist(
+                symbol="XAUUSD",
+                exchange="FX_IDC",
+                interval=Interval.in_30_minute,
+                n_bars=HISTORY_BARS,
+            )
+            return normalize_history(data)
+        except Exception as exc:
+            if attempt == 3:
+                raise
+            log.warning("TvDatafeed M30 history attempt %s/3 failed: %r; retrying.", attempt, exc)
+            time.sleep(attempt)
+        finally:
+            # TvDatafeed exposes its websocket as `ws`; close it after each one-shot pull.
+            ws = getattr(tv, "ws", None) if tv is not None else None
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    log.debug("Could not close TvDatafeed websocket", exc_info=True)
+    raise RuntimeError("Unable to fetch M30 history after retries")
+
+
+def closed_m30(history: pd.DataFrame, now: pd.Timestamp) -> pd.DataFrame:
+    cutoff = now.floor("30min")
+    return history.loc[history.index + pd.Timedelta(minutes=30) <= cutoff]
+
+
+def build_zones(history: pd.DataFrame, now: pd.Timestamp) -> list[dict[str, Any]]:
+    """Build same-color and opposite-color equal-point zones from closed adjacent M30 bars."""
+    bars = closed_m30(history, now)
+    zones: list[dict[str, Any]] = []
+    if len(bars) < 2:
+        return zones
+
+    for i in range(1, len(bars)):
+        t1, t2 = bars.index[i - 1], bars.index[i]
+        if t2 - t1 != pd.Timedelta(minutes=30):
+            continue
+        first, second = bars.iloc[i - 1], bars.iloc[i]
+        formed = t2 + pd.Timedelta(minutes=30)
+        if local_day(formed) != local_day(now):
+            continue
+        gap = abs(float(first["close"]) - float(second["open"]))
+        if gap > EQUAL_TOLERANCE + 1e-12:
+            continue
+
+        first_color = "green" if first["close"] > first["open"] else "red" if first["close"] < first["open"] else "doji"
+        second_color = "green" if second["close"] > second["open"] else "red" if second["close"] < second["open"] else "doji"
+        if "doji" in (first_color, second_color):
+            continue
+
+        if first_color == second_color:
+            side = "buy" if first_color == "green" else "sell"
+            pattern = f"same_{first_color}"
+        else:
+            # The reversal pattern uses the first candle's close versus the second candle's open.
+            side = "sell" if first_color == "green" and second_color == "red" else "buy"
+            pattern = f"opposite_{first_color}_{second_color}"
+
+        level = round((float(first["close"]) + float(second["open"])) / 2.0, 3)
+        key = f"{int(t2.timestamp())}|{side}|{pattern}"
+        zones.append({
+            "key": key,
+            "side": side,
+            "pattern": pattern,
+            "pattern_ar": "شمعتان متعاكستان" if first_color != second_color else "شمعتان من اللون نفسه",
+            "level": level,
+            "gap": round(gap, 6),
+            "first_candle_time": t1.isoformat(),
+            "second_candle_time": t2.isoformat(),
+            "formed": formed.isoformat(),
+            "expires": next_local_midnight_utc(formed).isoformat(),
+            "status": "watching",
+            "armed": False,
+            "armed_at": None,
+        })
+    return zones
+
+
+def historical_touch_time(zone: dict[str, Any], history: pd.DataFrame) -> Optional[pd.Timestamp]:
+    formed = as_utc(zone["formed"])
+    later = history.loc[history.index >= formed]
+    if later.empty:
+        return None
+    if zone["side"] == "buy":
+        hits = later.index[later["low"] <= float(zone["level"])]
+    else:
+        hits = later.index[later["high"] >= float(zone["level"])]
+    return hits[0] if len(hits) else None
+
+
+def normalize_live_event(event: dict[str, Any]) -> Optional[dict[str, Any]]:
     try:
-        import dukascopy_python as duka
-        import dukascopy_python.instruments as ins
-    except Exception as exc:
-        raise SystemExit(f"فشل استيراد dukascopy: {exc!r}") from exc
-    instruments = {}
-    for sym in ENABLED_SYMBOLS:
-        if sym not in CONFIGS:
-            raise SystemExit(f"رمز غير معروف: {sym}")
-        attr = CONFIGS[sym]["instrument_attr"]
-        if not hasattr(ins, attr):
-            raise SystemExit(f"الرمز {sym}: الثابت {attr} غير موجود في نسخة المكتبة المثبتة")
-        instruments[sym] = getattr(ins, attr)
-    return duka, instruments
+        received = pd.Timestamp(int(event["received_at_ms"]), unit="ms", tz="UTC")
+        bid, ask = float(event["bid"]), float(event["ask"])
+        lp = float(event["lp"]) if event.get("lp") is not None else (bid + ask) / 2
+        if not all(pd.notna(x) for x in (bid, ask, lp)) or bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        source_ms = event.get("lp_time_ms")
+        source_time = pd.Timestamp(int(source_ms), unit="ms", tz="UTC") if source_ms else None
+        return {
+            "received_at": received,
+            "source_time": source_time,
+            "bid": bid,
+            "ask": ask,
+            "lp": lp,
+        }
+    except Exception:
+        return None
 
 
-def fetch_1m(duka, instrument, side: str, hours: float = LOOKBACK_HOURS) -> pd.DataFrame:
-    now = pd.Timestamp.now(tz="UTC")
-    start = now - pd.Timedelta(hours=hours)
-    interval = getattr(duka, "INTERVAL_MIN_1")
-    offer_side = getattr(duka, f"OFFER_SIDE_{side}")
-    got = duka.fetch(
-        instrument=instrument,
-        interval=interval,
-        offer_side=offer_side,
-        start=start.to_pydatetime(),
-        end=now.to_pydatetime(),
-        max_retries=5,
-        limit=30_000,
-        debug=False,
-    )
-    if got is None or got.empty:
-        raise RuntimeError(f"No {side} data (market probably closed)")
-    got = got.copy()
-    got.columns = [str(c).lower() for c in got.columns]
-    idx = pd.DatetimeIndex(pd.to_datetime(got.index))
-    got.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-    got = got[~got.index.duplicated(keep="last")].sort_index()
-    for col in ("open", "high", "low", "close"):
-        got[col] = pd.to_numeric(got[col], errors="coerce")
-    return got.dropna(subset=["open", "high", "low", "close"])
-
-
-def resample(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    out = df.resample(f"{minutes}min", label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last"}
-    ).dropna()
-    now_floor = pd.Timestamp.now(tz="UTC").floor(f"{minutes}min")
-    return out[out.index + pd.Timedelta(minutes=minutes) <= now_floor]
-
-
-def riyadh(ts: pd.Timestamp) -> pd.Timestamp:
-    return ts.tz_convert(TIMEZONE)
-
-
-def allow_new_signal(ts: pd.Timestamp) -> bool:
-    local = riyadh(ts)
-    if NO_NEW_FIRST_HOUR and local.hour == 0:
-        return False
-    if NO_NEW_LAST_HOUR and local.hour == 23:
-        return False
-    return True
-
-
-# ========================= TELEGRAM =========================
+# ---------------- Telegram ----------------
 class TelegramSender:
     def __init__(self):
         self.client = None
 
     async def start(self):
         if not TELEGRAM_ENABLED:
-            log.warning("Telegram disabled.")
+            log.warning("Telegram disabled: preview mode only.")
             return
-        if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_SESSION_STRING:
-            raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH and TELEGRAM_SESSION_STRING")
+        if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_SESSION_STRING or not TELEGRAM_CHANNEL:
+            raise RuntimeError("Missing Telegram environment variables")
         from telethon import TelegramClient
         from telethon.sessions import StringSession
         self.client = TelegramClient(
-            StringSession(TELEGRAM_SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH,
-            connection_retries=None, retry_delay=1, auto_reconnect=True,
+            StringSession(TELEGRAM_SESSION_STRING),
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+            connection_retries=None,
+            retry_delay=2,
+            auto_reconnect=True,
         )
         await self.client.connect()
         if not await self.client.is_user_authorized():
-            raise RuntimeError("TELEGRAM_SESSION_STRING is invalid or expired; generate a new one")
+            raise RuntimeError("TELEGRAM_SESSION_STRING is invalid or expired")
         log.info("Telegram connected to %s", TELEGRAM_CHANNEL)
 
     async def send(self, text: str, reply_to: Optional[int] = None) -> Optional[int]:
-        if not TELEGRAM_ENABLED or self.client is None:
+        if not TELEGRAM_ENABLED:
             log.info("TELEGRAM PREVIEW:\n%s", text)
             return None
         msg = await self.client.send_message(TELEGRAM_CHANNEL, text, reply_to=reply_to)
         return int(msg.id)
-
-    async def edit_cancelled(self, message_id: Optional[int], text: str) -> None:
-        if not message_id or not TELEGRAM_ENABLED or self.client is None:
-            return
-        try:
-            await self.client.edit_message(TELEGRAM_CHANNEL, message_id, text)
-            await self.send("❌ **أُلغي الأمر المعلق** — سنأخذ فرصة أقرب إذا ظهرت.", reply_to=message_id)
-        except Exception:
-            log.exception("Could not edit cancelled message %s", message_id)
 
     async def close(self):
         if self.client:
             await self.client.disconnect()
 
 
-# ========================= FORMATTING =========================
-def cfg_of(tr: dict[str, Any]) -> dict[str, Any]:
-    return CONFIGS[sym_of(tr)]
-
-
-def fmt_price(x: float) -> str:
-    return f"{x:.2f}"
-
-
-def to_points(delta: float, c: dict[str, Any]) -> int:
-    return max(0, int(round(delta * c["pt"])))
-
-
-def side_word(side: str) -> str:
-    return "BUY" if side == "buy" else "SELL"
-
-
-def pending_text(tr: dict[str, Any]) -> str:
-    c = cfg_of(tr)
-    arrow = "📈 BUY LIMIT" if tr["side"] == "buy" else "📉 SELL LIMIT"
-    tps = "\n".join(f"{i}️⃣ TP{i} ➜ {fmt_price(x)}" for i, x in enumerate(tr["targets"], 1))
+# ---------------- Telegram message templates ----------------
+def entry_text(trade: dict[str, Any]) -> str:
+    icon = "📈" if trade["side"] == "buy" else "📉"
+    quote_side = "Ask" if trade["side"] == "buy" else "Bid"
     return (
-        "🔔 **توصية جديدة | صفقة معلقة** 🔔\n\n"
-        f"{c['label']}\n{arrow} ➜ **{fmt_price(tr['entry'])}**\n\n"
-        f"🛑 وقف الخسارة: **{fmt_price(tr['stop'])}**\n\n"
-        f"🎯 **الأهداف:**\n{tps}\n\n"
-        "⚠️ إدارة رأس المال مسؤوليتك\n"
-        "💡 لا تخاطر بأكثر من 1-2% ، هذه ليست آخر صفقة والسوق لن يهرب 🌍"
+        "🔔 **توصية جديدة | لمس منطقة تساوي M30** 🔔\n\n"
+        "🥇 **XAUUSD — الذهب فقط**\n"
+        f"{icon} **{side_ar(trade['side'])}**\n"
+        f"🧭 نوع المنطقة: {trade['pattern_ar']}\n"
+        f"📍 مستوى التساوي: **{fmt_price(trade['zone_level'])}**\n"
+        f"💵 دخول لحظي ({quote_side}): **{fmt_price(trade['entry'])}**\n"
+        f"🛑 وقف المتابعة: **{fmt_price(trade['stop'])}** (4.00$)\n"
+        "🎯 الهدف: **مفتوح** — متابعة السعر الحي\n\n"
+        "⚠️ تنبيه إشاري فقط؛ لا ينفذ البوت أوامر لدى وسيط."
     )
 
 
-def activated_text(tr: dict[str, Any]) -> str:
-    c = cfg_of(tr)
+def progress_text(trade: dict[str, Any], dollars: float) -> str:
+    points = int(round(dollars * POINTS_PER_DOLLAR))
     return (
-        "✅ **تم تفعيل الصفقة** 🚀\n\n"
-        f"{c['label']} | **{side_word(tr['side'])}**\n"
-        f"📍 دخول عند **{fmt_price(tr['entry'])}**\n\n"
-        "⏳ نتابع معكم وبالتوفيق للجميع 🤝"
+        f"🔥 **XAUUSD {side_ar(trade['side'])}**\n"
+        f"💰 أقصى حركة لصالح الصفقة: **+{dollars:.2f}$** (+{points} نقطة)\n"
+        "📡 التحديث من السعر الحي."
     )
 
 
-def progress_text(tr: dict[str, Any], points: int) -> str:
-    phrases = {30: "🔥 الصفقة تمشي صح ✅", 90: "💪🔥 يا وحش 🔥💪", 110: "👑 يا معلم 👑"}
-    phrase = phrases.get(points, "🔥 الصفقة مستمرة ✅")
-    return f"{phrase}\n💰 **+{points} نقطة** 📈✅"
-
-
-def tp_text(tr: dict[str, Any], n: int, points: int) -> str:
-    c = cfg_of(tr)
+def stop_text(trade: dict[str, Any]) -> str:
     return (
-        f"🎯 **تحقيق الهدف {n}** ✅\n"
-        f"💰 +{points} نقطة 🔥\n\n"
-        f"{c['label']} {side_word(tr['side'])}\n👏 مبروك للجميع 💚"
+        "🛑 **وصل السعر إلى مستوى وقف المتابعة**\n\n"
+        f"🥇 XAUUSD | {side_ar(trade['side'])}\n"
+        f"📍 الدخول: **{fmt_price(trade['entry'])}**\n"
+        f"🛑 مستوى الوقف: **{fmt_price(trade['stop'])}**\n"
+        "📉 النتيجة الاسمية عند الوقف: **−4.00$ (−40 نقطة)** قبل الانزلاق/اختلاف وسيطك.\n"
+        "هذا تحديث سعري، وليس تأكيدًا على تنفيذ أمر لدى وسيط."
     )
 
 
-def cancelled_text(tr: dict[str, Any]) -> str:
-    c = cfg_of(tr)
-    return (
-        "❌ **تم إلغاء الأمر المعلق**\n\n"
-        f"{c['label']} | {side_word(tr['side'])}\n"
-        f"📍 المستوى: {fmt_price(tr['entry'])}\n"
-        "🧹 لم يلمس السعر نقطة الدخول ضمن مدة الصلاحية."
-    )
+def legacy_progress_text(trade: dict[str, Any], dollars: float) -> str:
+    return progress_text(trade, dollars)
 
 
-def waiting_text(tr: dict[str, Any]) -> str:
-    c = cfg_of(tr)
-    return (
-        "❌ **تم إلغاء الأمر المعلق**\n\n"
-        f"{c['label']} | {side_word(tr['side'])}\n"
-        f"📍 المستوى: {fmt_price(tr['entry'])}\n"
-        "⏳ **انتظر**، ممكن ناخذها من مكان أقرب 👀"
-    )
-
-
-def all_targets_text(tr: dict[str, Any]) -> str:
-    c = cfg_of(tr)
-    total = to_points(abs(tr["targets"][-1] - tr["entry"]), c)
-    return f"🏆🏆🏆 **تحققت جميع الأهداف** 🎯🎯🎯\n{c['label']} {side_word(tr['side'])}\n💰 إجمالي: **+{total} نقطة** 🔥💎👑"
-
-
-# ========================= STRATEGY =========================
-def signal_key(sym: str, h2_start: pd.Timestamp, side: str) -> str:
-    return f"{sym}|{h2_start.isoformat()}|{side}"
-
-
-def build_targets(entry: float, side: str, c: dict[str, Any]) -> list[float]:
-    return [round(entry + x, 3) if side == "buy" else round(entry - x, 3) for x in c["tp_offsets"]]
-
-
-def detect_setups(sym: str, bid: pd.DataFrame, state: dict[str, Any]) -> list[dict[str, Any]]:
-    c = CONFIGS[sym]
-    h2 = resample(bid, 120)
-    m5 = resample(bid, 5)
-    setups: list[dict[str, Any]] = []
-    now_utc = pd.Timestamp.now(tz="UTC")
-    if len(h2) < 3 or len(m5) < 5:
-        return setups
-
-    for i in range(2, len(h2)):
-        hs = h2.index[i]
-        hb = h2.iloc[i]
-        if not allow_new_signal(hs):
-            continue
-        q = m5[(m5.index >= hs + pd.Timedelta(hours=2)) & (m5.index < hs + pd.Timedelta(hours=4))]
-        for j in range(1, len(q)):
-            first, second = q.iloc[j - 1], q.iloc[j]
-            confirm_time = q.index[j]
-            upper = max(float(first.high), float(second.high)) >= float(hb.high)
-            lower = min(float(first.low), float(second.low)) <= float(hb.low)
-            equal = (float(first.close) + float(second.open)) / 2
-            near = abs(float(first.close) - float(second.open)) <= c["max_equal_gap"]
-            sell = upper and near and first.close > first.open and second.close < second.open
-            buy = lower and near and first.close < first.open and second.close > second.open
-            if not (sell or buy):
-                continue
-            side = "sell" if sell else "buy"
-            key = signal_key(sym, hs, side)
-            if key in state["signals"]:
-                break
-            if now_utc - (confirm_time + pd.Timedelta(minutes=5)) > pd.Timedelta(minutes=SIGNAL_MAX_AGE_MINUTES):
-                continue
-            if sell:
-                raw_stop = max(float(first.high), float(second.high)) + c["raw_stop_buffer"]
-            else:
-                raw_stop = min(float(first.low), float(second.low)) - c["raw_stop_buffer"]
-            raw_risk = abs(equal - raw_stop)
-            if raw_risk < c["min_stop"]:
-                entry = equal
-                stop = equal + c["min_stop"] if sell else equal - c["min_stop"]
-            else:
-                entry = equal + c["pending_offset"] if sell else equal - c["pending_offset"]
-                stop = raw_stop
-            setups.append({
-                "key": key, "sym": sym, "side": side, "leg": "P1", "h2_start": hs.isoformat(),
-                "confirm_time": confirm_time.isoformat(), "entry": round(entry, 3),
-                "stop": round(stop, 3), "targets": build_targets(entry, side, c),
-                "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
-                "expiry": (confirm_time + pd.Timedelta(minutes=5) + pd.Timedelta(hours=PENDING_EXPIRY_HOURS)).isoformat(),
-                "message_id": None, "status": "pending", "last_progress": 0,
-                "hit_tps": [], "fvg_checked": False, "fvg_order": None,
-            })
-            break
-    return setups
-
-
-def make_fvg_order(tr: dict[str, Any], bid: pd.DataFrame, m5: pd.DataFrame) -> Optional[dict[str, Any]]:
-    c = cfg_of(tr)
-    if tr.get("fvg_checked"):
-        return tr.get("fvg_order")
-    confirm = pd.Timestamp(tr["confirm_time"])
-    if confirm.tzinfo is None:
-        confirm = confirm.tz_localize("UTC")
-    start = confirm + pd.Timedelta(minutes=15)
-    expiry = pd.Timestamp(tr["expiry"])
-    q = m5[(m5.index >= start) & (m5.index < expiry)]
-    for k in range(2, len(m5)):
-        ft = m5.index[k]
-        if ft not in q.index:
-            continue
-        c1, c3 = m5.iloc[k - 2], m5.iloc[k]
-        bullish = float(c1.high) < float(c3.low)
-        bearish = float(c1.low) > float(c3.high)
-        if tr["side"] == "buy" and bullish:
-            low, high = float(c1.high), float(c3.low)
-            entry, stop = high, low - c["fvg_stop"]
-        elif tr["side"] == "sell" and bearish:
-            low, high = float(c3.high), float(c1.low)
-            entry, stop = low, high + c["fvg_stop"]
+# ---------------- Trade creation / live management ----------------
+async def notify_entry(trade: dict[str, Any], state: dict[str, Any], tg: TelegramSender) -> None:
+    if trade.get("notification_status") in ("sent", "preview"):
+        return
+    try:
+        message_id = await tg.send(entry_text(trade))
+        trade["message_id"] = message_id
+        trade["notification_status"] = "preview" if message_id is None else "sent"
+        trade["notification_attempted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+        save_state(state)
+        if message_id is None:
+            log.warning("Trade detected in preview mode; no Telegram message was sent.")
         else:
-            continue
-        return {"entry": round(entry, 3), "stop": round(stop, 3), "formed": ft.isoformat(),
-                "targets": build_targets(entry, tr["side"], c)}
-    return None
+            log.info("Telegram signal sent: id=%s side=%s entry=%s zone=%s", message_id, trade["side"], trade["entry"], trade["zone_level"])
+    except Exception:
+        trade["notification_status"] = "pending_retry"
+        trade["notification_attempted_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+        save_state(state)
+        log.exception("Telegram signal send failed; it will be retried.")
 
 
-def find_closer(tr: dict[str, Any], m5: pd.DataFrame) -> Optional[dict[str, Any]]:
-    """
-    الأمر الأقرب (P2): شمعتا M5 متتاليتان بنفس لون الاتجاه (خضراوان للشراء / حمراوان للبيع)
-    وفارق إغلاق الأولى وافتتاح الثانية <= max_equal_gap.
-    الأمر عند نقطة التساوي ± closer_offset، والوقف = closer_stop من الدخول.
-    """
-    c = cfg_of(tr)
-    side = tr["side"]
-    since = pd.Timestamp(tr["wait_since"]).ceil("5min")
-    expiry = pd.Timestamp(tr["expiry"])
-    q = m5[m5.index >= since]
-    for j in range(1, len(q)):
-        a, b = q.iloc[j - 1], q.iloc[j]
-        if q.index[j] - q.index[j - 1] != pd.Timedelta(minutes=5):
-            continue
-        if q.index[j] + pd.Timedelta(minutes=5) >= expiry:
-            break
-        if side == "buy":
-            same_color = a.close > a.open and b.close > b.open
-        else:
-            same_color = a.close < a.open and b.close < b.open
-        if not same_color or abs(float(a.close) - float(b.open)) > c["max_equal_gap"]:
-            continue
+async def activate_zone(zone: dict[str, Any], quote: dict[str, Any], state: dict[str, Any], tg: TelegramSender) -> None:
+    if zone.get("status") != "watching":
+        return
+    key = zone["key"]
+    if key in state["trades"]:
+        zone["status"] = "triggered"
+        zone["trade_key"] = key
+        save_state(state)
+        return
 
-        equal = (float(a.close) + float(b.open)) / 2
-        if side == "buy":
-            entry = equal + c["closer_offset"]
-            stop = entry - c["closer_stop"]
-        else:
-            entry = equal - c["closer_offset"]
-            stop = entry + c["closer_stop"]
-
-        confirm_time = q.index[j]
-        return {
-            "key": f"{tr['key']}|P2", "sym": sym_of(tr), "side": side, "leg": "P2",
-            "h2_start": tr["h2_start"], "confirm_time": confirm_time.isoformat(),
-            "entry": round(entry, 3), "stop": round(stop, 3),
-            "targets": build_targets(entry, side, c),
-            "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
-            "expiry": tr["expiry"], "message_id": None, "status": "pending",
-            "last_progress": 0, "hit_tps": [], "fvg_checked": True, "fvg_order": None,
-        }
-    return None
-
-
-# ========================= LIVE ENGINE =========================
-def opposite(side: str) -> str:
-    return "buy" if side == "sell" else "sell"
-
-
-def merge_tail(old: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
-    if old is None or old.empty:
-        out = new
-    else:
-        out = pd.concat([old[~old.index.isin(new.index)], new]).sort_index()
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=LOOKBACK_HOURS + 1)
-    return out[out.index >= cutoff]
-
-
-def touch_time(side: str, level: float, trigger: pd.DataFrame, price: Optional[float],
-               start: pd.Timestamp, end: pd.Timestamp, now: pd.Timestamp) -> Optional[pd.Timestamp]:
-    fl = now.floor("1min")
-    q = trigger[(trigger.index >= start) & (trigger.index < end) & (trigger.index + pd.Timedelta(minutes=1) <= fl)]
-    hit = q[q.high >= level] if side == "sell" else q[q.low <= level]
-    if len(hit):
-        return hit.index[0] + pd.Timedelta(minutes=1)
-    if price is not None and start <= now < end:
-        if (side == "sell" and price >= level) or (side == "buy" and price <= level):
-            return now
-    return None
-
-
-async def cancel_opposites(state: dict[str, Any], sym: str, side: str, tg: "TelegramSender") -> None:
-    """بعد تفعيل صفقة: الأوامر المعلقة/المنتظِرة المعاكسة لنفس الرمز فقط تُلغى."""
-    for k, t in state["active"].items():
-        if sym_of(t) != sym or t["side"] != opposite(side):
-            continue
-        if t.get("status") == "pending":
-            t["status"] = "cancelled"
-            await tg.edit_cancelled(t.get("message_id"), cancelled_text(t))
-            if k in state["signals"]:
-                state["signals"][k]["status"] = "cancelled_opposite"
-        elif t.get("status") == "waiting":
-            t["status"] = "cancelled"
-            if k in state["signals"]:
-                state["signals"][k]["status"] = "cancelled_opposite"
-
-
-async def activate(state: dict[str, Any], tr: dict[str, Any], source: str, when: pd.Timestamp, tg: "TelegramSender") -> None:
-    tr["status"] = "active"
-    tr["entry_time"] = when.isoformat()
-    tr["entry_source"] = source
-    tr["best"] = tr["entry"]
-    await tg.send(activated_text(tr), reply_to=tr.get("message_id"))
-    await cancel_opposites(state, sym_of(tr), tr["side"], tg)
+    entry = float(quote["ask"] if zone["side"] == "buy" else quote["bid"])
+    stop = entry - FIXED_STOP_DOLLARS if zone["side"] == "buy" else entry + FIXED_STOP_DOLLARS
+    touched_at = as_utc(quote["received_at"])
+    trade = {
+        "key": key,
+        "zone_key": key,
+        "strategy": STRATEGY_VERSION,
+        "side": zone["side"],
+        "pattern": zone["pattern"],
+        "pattern_ar": zone["pattern_ar"],
+        "zone_level": float(zone["level"]),
+        "entry": round(entry, 3),
+        "stop": round(stop, 3),
+        "status": "active",
+        "entry_time": touched_at.isoformat(),
+        "touch_time": touched_at.isoformat(),
+        "entry_quote_side": "ask" if zone["side"] == "buy" else "bid",
+        "entry_lp": round(float(quote["lp"]), 3),
+        "best": round(entry, 3),
+        "last_progress": 0.0,
+        "message_id": None,
+        "notification_status": "pending",
+        "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    zone["status"] = "triggered"
+    zone["trade_key"] = key
+    zone["touch_time"] = touched_at.isoformat()
+    zone["armed"] = False
+    state["trades"][key] = trade
     save_state(state)
+    log.info("M30 zone touched: side=%s level=%s entry=%s at=%s", trade["side"], trade["zone_level"], trade["entry"], fmt_time(touched_at))
+    await notify_entry(trade, state, tg)
 
 
-async def nap(seconds: int) -> None:
-    for _ in range(seconds):
-        if STOP_REQUESTED:
+async def manage_open_trades(state: dict[str, Any], quote: dict[str, Any], tg: TelegramSender) -> bool:
+    changed = False
+    collections = (state.get("trades", {}), state.get("legacy_trades", {}))
+    for trades in collections:
+        for trade in list(trades.values()):
+            if trade.get("status") != "active":
+                continue
+            side = trade.get("side")
+            if side not in ("buy", "sell"):
+                continue
+            # Liquidation-side quote: long positions are valued/stopped on Bid;
+            # shorts are valued/stopped on Ask.
+            exit_price = float(quote["bid"] if side == "buy" else quote["ask"])
+            entry = float(trade["entry"])
+            previous_best = float(trade.get("best", entry))
+            best = max(previous_best, exit_price) if side == "buy" else min(previous_best, exit_price)
+            if abs(best - previous_best) >= 0.001:
+                trade["best"] = round(best, 3)
+                changed = True
+
+            stop = float(trade["stop"])
+            stopped = exit_price <= stop if side == "buy" else exit_price >= stop
+            if stopped:
+                trade["status"] = "closed_sl"
+                trade["close_reason"] = "LIVE_QUOTE_REACHED_STOP"
+                trade["closed_at"] = quote["received_at"].isoformat()
+                trade["close_quote"] = round(exit_price, 3)
+                changed = True
+                save_state(state)
+                try:
+                    await tg.send(stop_text(trade), reply_to=trade.get("message_id"))
+                except Exception:
+                    log.exception("Could not send stop-level update for trade %s", trade.get("key"))
+                log.info("Stop level reached: key=%s side=%s price=%s stop=%s", trade.get("key"), side, exit_price, stop)
+                continue
+
+            move = best - entry if side == "buy" else entry - best
+            if move >= PROGRESS_START_DOLLARS:
+                milestone = PROGRESS_START_DOLLARS + int((move - PROGRESS_START_DOLLARS) // PROGRESS_STEP_DOLLARS) * PROGRESS_STEP_DOLLARS
+                if milestone > float(trade.get("last_progress", 0.0)):
+                    trade["last_progress"] = float(milestone)
+                    changed = True
+                    save_state(state)
+                    try:
+                        await tg.send(progress_text(trade, milestone), reply_to=trade.get("message_id"))
+                        log.info("Progress update: key=%s milestone=%s dollars", trade.get("key"), milestone)
+                    except Exception:
+                        log.exception("Could not send progress update for trade %s", trade.get("key"))
+
+    if changed:
+        save_state(state)
+    return changed
+
+
+async def retry_unsent_notifications(state: dict[str, Any], tg: TelegramSender) -> None:
+    now = pd.Timestamp.now(tz="UTC")
+    for trade in state.get("trades", {}).values():
+        if trade.get("status") != "active" or trade.get("notification_status") != "pending_retry":
+            continue
+        attempted = trade.get("notification_attempted_at")
+        if attempted and (now - as_utc(attempted)).total_seconds() < 15:
+            continue
+        await notify_entry(trade, state, tg)
+
+
+# ---------------- Quote bridge / zone scanning ----------------
+async def start_quote_bridge() -> asyncio.subprocess.Process:
+    if not QUOTE_BRIDGE.exists():
+        raise FileNotFoundError(f"Missing Node quote bridge: {QUOTE_BRIDGE}")
+    env = os.environ.copy()
+    node_bin = os.getenv("NODE_BIN", "node")
+    return await asyncio.create_subprocess_exec(
+        node_bin,
+        str(QUOTE_BRIDGE),
+        cwd=str(BASE_DIR),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def quote_stdout_reader(proc: asyncio.subprocess.Process, queue: asyncio.Queue) -> None:
+    assert proc.stdout is not None
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            await queue.put({"type": "eof"})
             return
-        await asyncio.sleep(1)
-
-
-async def register_signal(state: dict[str, Any], tr: dict[str, Any], tg: "TelegramSender") -> None:
-    """إشارة جديدة: تُغلق بصمت أي صفقة نشطة/منتظِرة معاكسة لها في نفس الرمز فقط."""
-    sym = sym_of(tr)
-    for k, t in state["active"].items():
-        if sym_of(t) == sym and t.get("status") in ("active", "waiting") and t["side"] == opposite(tr["side"]):
-            t["status"] = "closed"
-            t["close_reason"] = "REVERSED"
-            if k in state["signals"]:
-                state["signals"][k]["status"] = "closed_reversed"
-            log.info("[%s] Stopped following %s (opposite signal %s)", sym, k, tr["key"])
-    msg_id = await tg.send(pending_text(tr))
-    tr["message_id"] = msg_id
-    state["signals"][tr["key"]] = {"created": tr["created_at"], "status": "pending"}
-    state["active"][tr["key"]] = tr
-    save_state(state)
-    log.info("[%s] New pending %s %s", sym, tr["key"], tr["entry"])
-
-
-async def live_loop(sym, duka, instrument, state, tg, cache, lock):
-    while not STOP_REQUESTED:
         try:
-            if any(sym_of(t) == sym and t.get("status") in ("pending", "active", "waiting")
-                   for t in state["active"].values()):
-                sb, sa = await asyncio.gather(
-                    asyncio.to_thread(fetch_1m, duka, instrument, "BID", LIVE_WINDOW_MINUTES / 60),
-                    asyncio.to_thread(fetch_1m, duka, instrument, "ASK", LIVE_WINDOW_MINUTES / 60),
-                )
-                async with lock:
-                    cache["bid"] = merge_tail(cache.get("bid"), sb)
-                    cache["ask"] = merge_tail(cache.get("ask"), sa)
-                    prices = {"bid": float(sb.close.iloc[-1]), "ask": float(sa.close.iloc[-1])}
-                    m5 = resample(cache["bid"], 5)
-                    await manage_trades(sym, state, cache["bid"], cache["ask"], m5, tg, prices)
-        except Exception as exc:
-            log.warning("[%s] Live tick failed (will retry): %r", sym, exc)
-        await asyncio.sleep(LIVE_POLL_SECONDS)
+            message = json.loads(line.decode("utf-8", errors="replace"))
+            await queue.put(message)
+        except Exception:
+            log.warning("Ignoring invalid line from live quote bridge: %r", line[:200])
 
 
-async def detect_loop(sym, duka, instrument, state, tg, cache, lock):
-    while not STOP_REQUESTED:
-        try:
-            bid, ask = await asyncio.gather(
-                asyncio.to_thread(fetch_1m, duka, instrument, "BID"),
-                asyncio.to_thread(fetch_1m, duka, instrument, "ASK"),
-            )
-            async with lock:
-                cache["bid"] = merge_tail(cache.get("bid"), bid)
-                cache["ask"] = merge_tail(cache.get("ask"), ask)
-                for tr in detect_setups(sym, cache["bid"], state):
-                    await register_signal(state, tr, tg)
-        except Exception as exc:
-            log.warning("[%s] Detect cycle failed (will retry): %r", sym, exc)
-        await nap(DETECT_POLL_SECONDS)
+async def quote_stderr_reader(proc: asyncio.subprocess.Process) -> None:
+    assert proc.stderr is not None
+    while True:
+        line = await proc.stderr.readline()
+        if not line:
+            return
+        text = line.decode("utf-8", errors="replace").strip()
+        if text:
+            log.info("TradingView quote bridge: %s", text)
 
 
-async def main_loop():
+def append_quote_history(buffer: deque, quote: dict[str, Any]) -> None:
+    if not buffer or quote["received_at"] >= buffer[-1]["received_at"]:
+        buffer.append(quote)
+
+
+async def add_zones_from_history(
+    history: pd.DataFrame,
+    state: dict[str, Any],
+    quote_history: deque,
+    bot_started_at: pd.Timestamp,
+    tg: TelegramSender,
+) -> None:
+    now = pd.Timestamp.now(tz="UTC")
+    candidates = build_zones(history, now)
+    changed = False
+    current_quote = quote_history[-1] if quote_history else None
+
+    for candidate in candidates:
+        key = candidate["key"]
+        if key in state["zones"]:
+            continue
+        state["zones"][key] = candidate
+        changed = True
+        formed = as_utc(candidate["formed"])
+        historical_hit = historical_touch_time(candidate, history)
+        live_hits = [q for q in quote_history if q["received_at"] >= formed and entry_triggered(candidate, q)]
+
+        if live_hits:
+            first_hit = live_hits[0]
+            delay = (now - first_hit["received_at"]).total_seconds()
+            if first_hit["received_at"] >= bot_started_at and 0 <= delay <= LATE_TOUCH_MAX_SECONDS:
+                await activate_zone(candidate, first_hit, state, tg)
+            else:
+                candidate["status"] = "consumed_stale_touch"
+                candidate["consumed_at"] = first_hit["received_at"].isoformat()
+        elif historical_hit is not None:
+            # The old historical feed shows the level was already touched, but there is
+            # no recent live tick to price a fresh signal safely. Do not send a stale alert.
+            candidate["status"] = "consumed_historical_touch"
+            candidate["historical_touch_bar"] = historical_hit.isoformat()
+        elif current_quote is not None and current_quote["received_at"] >= formed:
+            if quote_is_pre_touch(candidate, current_quote):
+                candidate["armed"] = True
+                candidate["armed_at"] = current_quote["received_at"].isoformat()
+            elif entry_triggered(candidate, current_quote):
+                candidate["status"] = "consumed_ambiguous_touch"
+                candidate["consumed_at"] = current_quote["received_at"].isoformat()
+
+    # Expire untriggered zones at Riyadh midnight; active trades continue to be tracked.
+    for zone in state["zones"].values():
+        if zone.get("status") == "watching" and now >= as_utc(zone["expires"]):
+            zone["status"] = "expired"
+            zone["expired_at"] = now.isoformat()
+            changed = True
+
+    if changed:
+        save_state(state)
+    HEALTH["active_zones"] = sum(1 for z in state["zones"].values() if z.get("status") == "watching")
+    log.info("Historical M30 refreshed: bars=%s new_candidates=%s watching=%s", len(history), len(candidates), HEALTH["active_zones"])
+
+
+async def process_live_quote(
+    quote: dict[str, Any],
+    state: dict[str, Any],
+    quote_history: deque,
+    tg: TelegramSender,
+) -> None:
+    now = pd.Timestamp.now(tz="UTC")
+    age = (now - quote["received_at"]).total_seconds()
+    if age < -5 or age > QUOTE_STALE_SECONDS:
+        log.warning("Ignoring stale/out-of-order quote event (age %.1fs).", age)
+        return
+
+    append_quote_history(quote_history, quote)
+    HEALTH.update({
+        "live_quote_connected": True,
+        "last_quote_received_utc": quote["received_at"].isoformat(),
+        "last_quote_time_utc": quote["source_time"].isoformat() if quote.get("source_time") is not None else None,
+        "last_lp": round(float(quote["lp"]), 3),
+        "bid": round(float(quote["bid"]), 3),
+        "ask": round(float(quote["ask"]), 3),
+    })
+
+    changed = False
+    for zone in list(state["zones"].values()):
+        if zone.get("status") != "watching":
+            continue
+        tick_time = quote["received_at"]
+        formed = as_utc(zone["formed"])
+        if tick_time < formed:
+            continue
+        if tick_time >= as_utc(zone["expires"]):
+            zone["status"] = "expired"
+            zone["expired_at"] = tick_time.isoformat()
+            changed = True
+            continue
+
+        touched = entry_triggered(zone, quote)
+        if not zone.get("armed", False):
+            if quote_is_pre_touch(zone, quote):
+                zone["armed"] = True
+                zone["armed_at"] = tick_time.isoformat()
+                changed = True
+            elif touched:
+                # No observed pre-touch quote after the zone became eligible; avoid a
+                # possibly stale/imprecise entry when starting or reconnecting.
+                zone["status"] = "consumed_ambiguous_touch"
+                zone["consumed_at"] = tick_time.isoformat()
+                changed = True
+            continue
+
+        if zone.get("armed_at") and tick_time <= as_utc(zone["armed_at"]):
+            continue
+        if touched:
+            await activate_zone(zone, quote, state, tg)
+            changed = True
+
+    if changed:
+        save_state(state)
+    await manage_open_trades(state, quote, tg)
+    HEALTH["active_trades"] = sum(1 for t in state.get("trades", {}).values() if t.get("status") == "active") + sum(
+        1 for t in state.get("legacy_trades", {}).values() if t.get("status") == "active"
+    )
+
+
+# ---------------- Main service ----------------
+async def stop_process(proc: Optional[asyncio.subprocess.Process]) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def main():
     await start_web_server()
-    duka, instruments = get_duka()
     tg = TelegramSender()
     await tg.start()
     state = load_state()
 
-    if not state.get("started_message_sent"):
-        await tg.send("اللهم صلِّ وسلّم وبارك على نبينا محمد وعلى آله وصحبه أجمعين ❤️")
-        state["started_message_sent"] = True
-        save_state(state)
+    # Preserve the requested startup message on every launch.
+    try:
+        message_id = await tg.send(STARTUP_MESSAGE)
+        log.info("Startup announcement sent%s", f" (id={message_id})" if message_id else " in preview mode")
+    except Exception:
+        log.exception("Could not send the startup announcement; the bot will keep running.")
 
-    tasks = []
-    for sym in ENABLED_SYMBOLS:
-        cache: dict[str, pd.DataFrame] = {}
-        lock = asyncio.Lock()
-        tasks.append(live_loop(sym, duka, instruments[sym], state, tg, cache, lock))
-        tasks.append(detect_loop(sym, duka, instruments[sym], state, tg, cache, lock))
-        log.info("Tracking %s", sym)
-    await asyncio.gather(*tasks)
+    bot_started_at = pd.Timestamp.now(tz="UTC")
+    quote_history: deque = deque(maxlen=QUOTE_BUFFER_SIZE)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
+    proc = None
+    stdout_task = None
+    stderr_task = None
+    try:
+        proc = await start_quote_bridge()
+        stdout_task = asyncio.create_task(quote_stdout_reader(proc, queue))
+        stderr_task = asyncio.create_task(quote_stderr_reader(proc))
+        log.info("Started live quote bridge for %s", SYMBOL)
+    except Exception:
+        log.exception("Could not start Node live quote bridge; will retry.")
+
+    history_task: Optional[asyncio.Task] = asyncio.create_task(asyncio.to_thread(fetch_m30_history))
+    next_history_fetch = time.monotonic() + HISTORY_REFRESH_SECONDS
+    last_node_retry = time.monotonic()
+    last_stale_log = 0.0
+    history_loaded = False
+
+    while not STOP_REQUESTED:
+        # Resolve a completed history request without blocking the quote stream.
+        if history_task is not None and history_task.done():
+            try:
+                history = history_task.result()
+                await add_zones_from_history(history, state, quote_history, bot_started_at, tg)
+                history_loaded = True
+                HEALTH["last_history_bar_utc"] = history.index[-1].isoformat()
+                HEALTH["last_history_refresh_utc"] = pd.Timestamp.now(tz="UTC").isoformat()
+                HEALTH["history_loaded"] = True
+            except Exception:
+                log.exception("TvDatafeed history refresh failed; keeping current zones and retrying.")
+                HEALTH["history_loaded"] = history_loaded
+            history_task = None
+            next_history_fetch = time.monotonic() + HISTORY_REFRESH_SECONDS
+
+        if history_task is None and time.monotonic() >= next_history_fetch:
+            history_task = asyncio.create_task(asyncio.to_thread(fetch_m30_history))
+
+        # Restart the bridge if Node exited; a live but quiet stream remains connected.
+        if (proc is None or proc.returncode is not None or (stdout_task is not None and stdout_task.done())) and time.monotonic() - last_node_retry >= 5:
+            await stop_process(proc)
+            try:
+                proc = await start_quote_bridge()
+                stdout_task = asyncio.create_task(quote_stdout_reader(proc, queue))
+                stderr_task = asyncio.create_task(quote_stderr_reader(proc))
+                log.info("Restarted live quote bridge for %s", SYMBOL)
+            except Exception:
+                log.exception("Live quote bridge restart failed; retrying.")
+            last_node_retry = time.monotonic()
+            HEALTH["live_quote_connected"] = False
+
+        try:
+            event = await asyncio.wait_for(queue.get(), timeout=0.5)
+        except asyncio.TimeoutError:
+            event = None
+
+        if event:
+            kind = event.get("type")
+            if kind == "quote":
+                quote = normalize_live_event(event)
+                if quote is None:
+                    log.warning("Received an incomplete live quote; skipping it.")
+                else:
+                    HEALTH["live_quote_connected"] = True
+                    await process_live_quote(quote, state, quote_history, tg)
+            elif kind == "status":
+                connected = event.get("status") == "connected"
+                HEALTH["live_quote_connected"] = connected
+                log.info("Live quote stream status: %s", event.get("status"))
+            elif kind == "eof":
+                HEALTH["live_quote_connected"] = False
+                log.warning("Live quote bridge ended; waiting for restart.")
+
+        await retry_unsent_notifications(state, tg)
+        if history_loaded:
+            HEALTH["active_zones"] = sum(1 for z in state.get("zones", {}).values() if z.get("status") == "watching")
+
+        last_received = HEALTH.get("last_quote_received_utc")
+        if last_received:
+            quote_age = (pd.Timestamp.now(tz="UTC") - as_utc(last_received)).total_seconds()
+            if quote_age > QUOTE_STALE_SECONDS:
+                HEALTH["live_quote_connected"] = False
+                if time.monotonic() - last_stale_log >= 30:
+                    log.warning("No fresh TradingView quote for %.1fs; price-trigger and stop checks are paused until fresh data returns.", quote_age)
+                    last_stale_log = time.monotonic()
+
     save_state(state)
+    await stop_process(proc)
+    for task in (stdout_task, stderr_task, history_task):
+        if task is not None and not task.done():
+            task.cancel()
     await tg.close()
-
-
-async def manage_trades(sym: str, state: dict[str, Any], bid: pd.DataFrame, ask: pd.DataFrame, m5: pd.DataFrame,
-                        tg: TelegramSender, prices: Optional[dict[str, float]] = None):
-    c = CONFIGS[sym]
-    now = pd.Timestamp.now(tz="UTC")
-    fl = now.floor("1min")
-    one_min = pd.Timedelta(minutes=1)
-    remove = []
-    for key, tr in list(state.get("active", {}).items()):
-        if sym_of(tr) != sym:
-            continue
-        if tr.get("status") in ("closed", "cancelled"):
-            remove.append(key)
-            continue
-        side = tr["side"]
-        trigger = bid if side == "sell" else ask
-        price = (prices or {}).get("bid" if side == "sell" else "ask")
-        reply_to = tr.get("message_id")
-        confirm = pd.Timestamp(tr["confirm_time"])
-        if confirm.tzinfo is None:
-            confirm = confirm.tz_localize("UTC")
-        active_start = confirm + pd.Timedelta(minutes=5)
-        expiry = pd.Timestamp(tr["expiry"])
-        if expiry.tzinfo is None:
-            expiry = expiry.tz_localize("UTC")
-
-        if tr["status"] == "pending":
-            when = touch_time(side, tr["entry"], trigger, price, active_start, expiry, now)
-            if when is not None:
-                await activate(state, tr, tr.get("leg", "P1"), when, tg)
-                continue
-
-            created = pd.Timestamp(tr["created_at"])
-            if created.tzinfo is None:
-                created = created.tz_localize("UTC")
-            if tr.get("leg", "P1") == "P1" and now >= created + pd.Timedelta(minutes=PENDING_CANCEL_MINUTES):
-                tr["status"] = "waiting"
-                tr["wait_since"] = now.isoformat()
-                await tg.send(waiting_text(tr), reply_to=tr.get("message_id"))
-                if key in state["signals"]:
-                    state["signals"][key]["status"] = "cancelled_wait"
-                save_state(state)
-                continue
-
-            if USE_FVG:
-                if now >= active_start + pd.Timedelta(minutes=FVG_DELAY_MINUTES) and tr.get("fvg_order") is None and not tr.get("fvg_checked"):
-                    tr["fvg_order"] = make_fvg_order(tr, bid, m5)
-                    tr["fvg_checked"] = True
-                    save_state(state)
-                fvg = tr.get("fvg_order")
-                if fvg:
-                    fstart = pd.Timestamp(fvg["formed"]) + pd.Timedelta(minutes=5)
-                    when2 = touch_time(side, fvg["entry"], trigger, price, fstart, expiry, now)
-                    if when2 is not None:
-                        tr["entry"] = fvg["entry"]
-                        tr["stop"] = fvg["stop"]
-                        tr["targets"] = fvg["targets"]
-                        await activate(state, tr, "P2-FVG", when2, tg)
-                        continue
-            if now >= expiry:
-                tr["status"] = "cancelled"
-                await tg.edit_cancelled(tr.get("message_id"), cancelled_text(tr))
-                if key in state["signals"]:
-                    state["signals"][key]["status"] = "cancelled"
-                save_state(state)
-                remove.append(key)
-
-        elif tr["status"] == "waiting":
-            if now >= expiry:
-                tr["status"] = "cancelled"
-                if key in state["signals"]:
-                    state["signals"][key]["status"] = "cancelled"
-                save_state(state)
-                remove.append(key)
-                continue
-            new_tr = find_closer(tr, m5)
-            if new_tr is not None and new_tr["key"] not in state["signals"]:
-                tr["status"] = "closed"
-                tr["close_reason"] = "REPLACED"
-                remove.append(key)
-                await register_signal(state, new_tr, tg)
-
-        elif tr["status"] == "active":
-            entry_dt = pd.Timestamp(tr["entry_time"])
-            ent_min = entry_dt.floor("1min")
-            cl = trigger[(trigger.index > ent_min) & (trigger.index + one_min <= fl)]
-            best = float(tr.get("best", tr["entry"]))
-            if side == "sell":
-                if len(cl):
-                    best = min(best, float(cl.low.min()))
-                if price is not None:
-                    best = min(best, price)
-                stopped = (len(cl) and float(cl.high.max()) >= tr["stop"]) or (price is not None and price >= tr["stop"])
-                move = tr["entry"] - best
-            else:
-                if len(cl):
-                    best = max(best, float(cl.high.max()))
-                if price is not None:
-                    best = max(best, price)
-                stopped = (len(cl) and float(cl.low.min()) <= tr["stop"]) or (price is not None and price <= tr["stop"])
-                move = best - tr["entry"]
-            tr["best"] = best
-
-            if stopped:
-                tr["status"] = "closed"
-                tr["close_reason"] = "SL"
-                if key in state["signals"]:
-                    state["signals"][key]["status"] = "closed_sl"
-                save_state(state)
-                remove.append(key)
-                continue
-
-            points = max(0, int(round(move * c["pt"])))
-            for n, target in enumerate(tr["targets"], 1):
-                touched = best <= target if side == "sell" else best >= target
-                if touched and n not in tr["hit_tps"]:
-                    tr["hit_tps"].append(n)
-                    await tg.send(tp_text(tr, n, to_points(abs(target - tr["entry"]), c)), reply_to=reply_to)
-                    save_state(state)
-            start_pts = int(round(c["progress_start"] * c["pt"]))
-            step_pts = int(round(c["progress_step"] * c["pt"]))
-            if points >= start_pts:
-                milestone = start_pts + ((points - start_pts) // step_pts) * step_pts
-                if milestone > tr.get("last_progress", 0):
-                    tr["last_progress"] = milestone
-                    await tg.send(progress_text(tr, milestone), reply_to=reply_to)
-                    save_state(state)
-            if len(tr["hit_tps"]) == len(tr["targets"]):
-                await tg.send(all_targets_text(tr), reply_to=reply_to)
-                tr["status"] = "closed"
-                tr["close_reason"] = "ALL_TP"
-                if key in state["signals"]:
-                    state["signals"][key]["status"] = "closed_tp"
-                save_state(state)
-                remove.append(key)
-    for key in remove:
-        state["active"].pop(key, None)
-    save_state(state)
+    log.info("Bot stopped cleanly.")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
         pass
