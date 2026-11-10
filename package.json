@@ -1,0 +1,13 @@
+{
+  "name": "snb-gold-m30-live-telegram",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Live XAUUSD quote bridge for the Python Telegram alert bot",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mathieuc/tradingview": "4.1.1"
+  }
+}
