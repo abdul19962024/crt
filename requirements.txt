@@ -1,5 +1,5 @@
-pandas>=2.2,<3.0
-aiohttp>=3.9,<4.0
-Telethon>=1.38,<2.0
-websocket-client>=1.8,<2.0
-git+https://github.com/rongardF/tvdatafeed.git
+telethon
+aiohttp
+pandas
+requests
+dukascopy-python<5
