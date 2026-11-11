@@ -278,6 +278,13 @@ def price_to_pips(delta: float, tr: dict) -> int:
     return max(0, int(round(delta / cfg(tr)["pip_size"])))
 
 
+def progress_milestones(pips: int, last_progress: int) -> list[int]:
+    if pips < PROGRESS_START_PIPS:
+        return []
+    first = PROGRESS_START_PIPS if last_progress < PROGRESS_START_PIPS else last_progress + PROGRESS_STEP_PIPS
+    return list(range(first, pips + 1, PROGRESS_STEP_PIPS))
+
+
 def side_word(side):
     return "BUY" if side == "buy" else "SELL"
 
@@ -531,12 +538,10 @@ async def manage_trades(state, bid, ask, m5, tg, asset, now=None):
                     tr["hit_tps"].append(n)
                     await tg.send(tp_text(tr, n, price_to_pips(abs(target - tr["entry"]), tr)))
                     save_state(state)
-            if pips >= PROGRESS_START_PIPS:
-                milestone = (pips // PROGRESS_STEP_PIPS) * PROGRESS_STEP_PIPS
-                if milestone > tr.get("last_progress", 0):
-                    tr["last_progress"] = milestone
-                    await tg.send(progress_text(tr, milestone))
-                    save_state(state)
+            for milestone in progress_milestones(pips, tr.get("last_progress", 0)):
+                tr["last_progress"] = milestone
+                await tg.send(progress_text(tr, milestone))
+                save_state(state)
             if len(tr["hit_tps"]) == len(tr["targets"]):
                 await tg.send(all_targets_text(tr))
                 tr["status"] = "closed"
@@ -567,7 +572,8 @@ async def main_loop():
         for _ in range(POLL_SECONDS):
             if STOP_REQUESTED: break
             await asyncio.sleep(1)
-        save_state(state);await tg.close()
+        save_state(state)
+    await tg.close()
 
 
 async def self_test_order_flow():
@@ -637,8 +643,10 @@ async def self_test_order_flow():
             old_saved = {"active": {"old": {"status": "pending", "confirm_time": confirm.isoformat(), "created_at": (now - pd.Timedelta(minutes=12)).isoformat(), "expiry": (now + pd.Timedelta(hours=2)).isoformat(), "leg": "P1"}}, "signals": {}}
             normalize_pending_state(old_saved, now)
             assert pd.Timestamp(old_saved["active"]["old"]["expiry"]) == now - pd.Timedelta(minutes=2)
+            assert progress_milestones(30, 0) == [30]
+            assert progress_milestones(70, 30) == [50, 70]
 
-        print("SELF-TEST PASSED: P1/P2 10-minute expiry, FVG edge with XAU stop 3.00$, opposite pending cancellation, active-trade retention, and old-state normalization.")
+        print("SELF-TEST PASSED: P1/P2 10-minute expiry, FVG edge with XAU stop 3.00$, opposite pending cancellation, active-trade retention, old-state normalization, and +30/+50/+70 progress alerts.")
     finally:
         globals()["DATA_DIR"] = old_data_dir
         globals()["STATE_FILE"] = old_state_file
